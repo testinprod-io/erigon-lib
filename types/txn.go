@@ -94,6 +94,8 @@ type TxSlot struct {
 	AlAddrCount    int // Number of addresses in the access list
 	AlStorCount    int // Number of storage keys in the access list
 
+	RollupDataGas uint64 // Translates into a L1 cost based on fee parameters
+
 	Rlp []byte // TxPool set it to nil after save it to db
 }
 
@@ -178,6 +180,10 @@ func (ctx *TxParseContext) ParseTransaction(payload []byte, pos int, slot *TxSlo
 		slot.Rlp = payload[pos : dataPos+dataLen]
 	}
 
+	if txType == 0x7E {
+		return 0, fmt.Errorf("%w: cannot accept deposit tx into tx pool: %s", ErrParseTxn, err)
+	}
+
 	if ctx.validateRlp != nil {
 		if err := ctx.validateRlp(slot.Rlp); err != nil {
 			return p, err
@@ -258,6 +264,21 @@ func (ctx *TxParseContext) ParseTransaction(payload []byte, pos int, slot *TxSlo
 		if byt != 0 {
 			slot.DataNonZeroLen++
 		}
+	}
+
+	{
+		// full tx contents count towards rollup data gas, not just tx data
+		var zeroes, ones uint64
+		for _, byt := range payload {
+			if byt == 0 {
+				zeroes++
+			} else {
+				ones++
+			}
+		}
+		zeroesGas := zeroes * 4
+		onesGas := (ones + 68) * 16
+		slot.RollupDataGas = zeroesGas + onesGas
 	}
 
 	p = dataPos + dataLen
