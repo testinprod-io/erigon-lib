@@ -468,13 +468,20 @@ func (p *TxPool) OnNewBlock(ctx context.Context, stateChanges *remote.StateChang
 	}
 
 	if p.cfg.Optimism {
+		err := coreTx.ForEach(kv.HashedStorage, nil, func(k, v []byte) error {
+			log.Info("walking full state HashedStorage", "k", fmt.Sprintf("%x", k), "v", fmt.Sprintf("%x", v))
+			return nil
+		})
+		if err != nil {
+			log.Error("full state HashedStorage error", "err", err)
+		}
 		var (
 			OVM_GasPriceOracleAddr = [20]byte{0: 0x42, 19: 0x0F}
 			//L1BlockAddr            = [20]byte{0: 0x42, 19: 0x15}
 		)
 		prefix := make([]byte, 20+8)
 		copy(prefix[:20], OVM_GasPriceOracleAddr[:])
-		err := coreTx.ForPrefix(kv.HashedStorage, prefix, func(k, v []byte) error {
+		err = coreTx.ForPrefix(kv.HashedStorage, prefix, func(k, v []byte) error {
 			log.Info("walking gas price oracle HashedStorage", "k", fmt.Sprintf("%x", k), "v", fmt.Sprintf("%x", v))
 			return nil
 		})
@@ -490,7 +497,7 @@ func (p *TxPool) OnNewBlock(ctx context.Context, stateChanges *remote.StateChang
 		}
 		l1CostFn, err := makeL1CostFn(coreTx)
 		if err != nil {
-			return fmt.Errorf("failed to load L1 rollup cost params: %w", err)
+			return fmt.Errorf("failed to load L1 rollup cost params real: %w", err)
 		}
 		p.l1Cost = l1CostFn
 	}
