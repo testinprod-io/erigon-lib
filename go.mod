@@ -2,6 +2,10 @@ module github.com/ledgerwatch/erigon-lib
 
 go 1.18
 
+replace (
+	github.com/ledgerwatch/interfaces v0.0.0-20221110171008-1309329613dc => github.com/protolambda/erigon-interfaces v0.0.0-20221118222946-5a476aa07576
+)
+
 require (
 	github.com/RoaringBitmap/roaring v1.2.1
 	github.com/VictoriaMetrics/metrics v1.22.2

@@ -96,6 +96,8 @@ type TxSlot struct {
 	IDHash         [32]byte // Transaction hash for the purposes of using it as a transaction Id
 	Traced         bool     // Whether transaction needs to be traced throughout transaction pool code and generate debug printing
 	Creation       bool     // Set to true if "To" field of the transaction is not set
+
+	RollupDataGas uint64 // Translates into a L1 cost based on fee parameters
 }
 
 const (
@@ -259,6 +261,20 @@ func (ctx *TxParseContext) ParseTransaction(payload []byte, pos int, slot *TxSlo
 		if byt != 0 {
 			slot.DataNonZeroLen++
 		}
+	}
+	{
+		// full tx contents count towards rollup data gas, not just tx data
+		var zeroes, ones uint64
+		for _, byt := range payload {
+			if byt == 0 {
+				zeroes++
+			} else {
+				ones++
+			}
+		}
+		zeroesGas := zeroes * 4
+		onesGas := (ones + 68) * 16
+		slot.RollupDataGas = zeroesGas + onesGas
 	}
 
 	p = dataPos + dataLen

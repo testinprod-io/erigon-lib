@@ -23,6 +23,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"github.com/ledgerwatch/erigon-lib/rlp"
 	"math"
 	"runtime"
 	"sort"
@@ -79,6 +80,8 @@ type Config struct {
 	MinFeeCap             uint64
 	AccountSlots          uint64 // Number of executable transaction slots guaranteed per account
 	PriceBump             uint64 // Price bump percentage to replace an already existing transaction
+
+	Optimism bool
 }
 
 var DefaultConfig = Config{
@@ -94,6 +97,8 @@ var DefaultConfig = Config{
 	MinFeeCap:    1,
 	AccountSlots: 16, //TODO: to choose right value (16 to be compatible with Geth)
 	PriceBump:    10, // Price bump percentage to replace an already existing transaction
+
+	Optimism: false,
 }
 
 // Pool is interface for the transaction pool
@@ -278,6 +283,8 @@ func calcProtocolBaseFee(baseFee uint64) uint64 {
 	return 7
 }
 
+type L1CostFn func(tx *types.TxSlot) *uint256.Int
+
 // TxPool - holds all pool-related data structures and lock-based tiny methods
 // most of logic implemented by pure tests-friendly functions
 //
@@ -315,6 +322,8 @@ type TxPool struct {
 	started                 atomic.Bool
 	pendingBaseFee          atomic.Uint64
 	blockGasLimit           atomic.Uint64
+
+	l1Cost L1CostFn
 }
 
 func New(newTxs chan types.Hashes, coreDB kv.RoDB, cfg Config, cache kvcache.Cache, chainID uint256.Int) (*TxPool, error) {
@@ -358,6 +367,69 @@ func New(newTxs chan types.Hashes, coreDB kv.RoDB, cfg Config, cache kvcache.Cac
 	}, nil
 }
 
+func RawRLPTxToOptimismL1CostFn(payload []byte) (L1CostFn, error) {
+	// skip prefix byte
+	if len(payload) == 0 {
+		return nil, fmt.Errorf("empty tx payload")
+	}
+	if payload[0] != 0x7E {
+		return nil, fmt.Errorf("expected deposit tx type, but got %d", payload[0])
+	}
+	pos := 1
+	_, _, isList, err := rlp.Prefix(payload, pos)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse rlp prefix: %w", err)
+	}
+	if !isList {
+		return nil, fmt.Errorf("expected list")
+	}
+	dataPos, _, err := rlp.List(payload, pos)
+	if err != nil {
+		return nil, fmt.Errorf("bad tx rlp list start: %w", err)
+	}
+	pos = dataPos
+
+	// skip 7 fields:
+	// source hash
+	// from
+	// to
+	// mint
+	// value
+	// gas
+	// isSystemTx
+	for i := 0; i < 7; i++ {
+		dataPos, dataLen, _, err := rlp.Prefix(payload, pos)
+		if err != nil {
+			return nil, fmt.Errorf("failed to skip rlp element %d of tx: %w", err)
+		}
+		pos = dataPos + dataLen
+	}
+	// data
+	dataPos, dataLen, _, err := rlp.Prefix(payload, pos)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read tx data entry rlp prefix: %w", err)
+	}
+	txCalldata := payload[dataPos : dataPos+dataLen]
+
+	if len(txCalldata) < 4+32*8 { // function selector + 8 arguments to setL1BlockValues
+		return nil, fmt.Errorf("expected more calldata to read L1 info from, but only got %d", len(txCalldata))
+	}
+	l1Basefee := new(uint256.Int).SetBytes(txCalldata[4+32*2 : 4+32*3]) // arg index 2
+	overhead := new(uint256.Int).SetBytes(txCalldata[4+32*6 : 4+32*7])  // arg index 6
+	scalar := new(uint256.Int).SetBytes(txCalldata[4+32*7 : 4+32*8])    // arg index 7
+	return func(tx *types.TxSlot) *uint256.Int {
+		return L1Cost(tx.RollupDataGas, l1Basefee, overhead, scalar)
+	}, nil
+}
+
+func L1Cost(rollupDataGas uint64, l1BaseFee, overhead, scalar *uint256.Int) *uint256.Int {
+	l1GasUsed := new(uint256.Int).SetUint64(rollupDataGas)
+	l1GasUsed = l1GasUsed.Add(l1GasUsed, overhead)
+	l1Cost := l1GasUsed.Mul(l1GasUsed, l1BaseFee)
+	l1Cost = l1Cost.Mul(l1Cost, scalar)
+	return l1Cost.Div(l1Cost, uint256.NewInt(1_000_000))
+}
+
 func (p *TxPool) OnNewBlock(ctx context.Context, stateChanges *remote.StateChangeBatch, unwindTxs, minedTxs types.TxSlots, tx kv.Tx) error {
 	defer newBlockTimer.UpdateDuration(time.Now())
 	//t := time.Now()
@@ -390,6 +462,17 @@ func (p *TxPool) OnNewBlock(ctx context.Context, stateChanges *remote.StateChang
 		}
 	}
 
+	if p.cfg.Optimism {
+		lastChangeBatch := stateChanges.ChangeBatch[len(stateChanges.ChangeBatch)-1]
+		if len(lastChangeBatch.Txs) > 0 {
+			l1CostFn, err := RawRLPTxToOptimismL1CostFn(lastChangeBatch.Txs[0])
+			if err == nil {
+				p.l1Cost = l1CostFn
+			} else {
+				log.Error("Tx pool failed to prepare Optimism L1 cost function", "err", err, "block_number", lastChangeBatch.BlockHeight)
+			}
+		}
+	}
 	if err := minedTxs.Valid(); err != nil {
 		return err
 	}
@@ -438,7 +521,7 @@ func (p *TxPool) OnNewBlock(ctx context.Context, stateChanges *remote.StateChang
 	p.baseFee.resetAddedHashes()
 	if err := addTxsOnNewBlock(p.lastSeenBlock.Load(), cacheView, stateChanges, p.senders, unwindTxs,
 		pendingBaseFee, stateChanges.BlockGasLimit,
-		p.pending, p.baseFee, p.queued, p.all, p.byHash, p.addLocked, p.discardLocked); err != nil {
+		p.pending, p.baseFee, p.queued, p.all, p.byHash, p.addLocked, p.discardLocked, p.l1Cost); err != nil {
 		return err
 	}
 	p.pending.EnforceWorstInvariants()
@@ -503,7 +586,7 @@ func (p *TxPool) processRemoteTxs(ctx context.Context) error {
 	p.pending.resetAddedHashes()
 	p.baseFee.resetAddedHashes()
 	if _, err := addTxs(p.lastSeenBlock.Load(), cacheView, p.senders, newTxs,
-		p.pendingBaseFee.Load(), p.blockGasLimit.Load(), p.pending, p.baseFee, p.queued, p.all, p.byHash, p.addLocked, p.discardLocked); err != nil {
+		p.pendingBaseFee.Load(), p.blockGasLimit.Load(), p.pending, p.baseFee, p.queued, p.all, p.byHash, p.addLocked, p.discardLocked, p.l1Cost); err != nil {
 		return err
 	}
 	p.promoted = p.pending.appendAddedHashes(p.promoted[:0])
@@ -839,7 +922,7 @@ func (p *TxPool) AddLocalTxs(ctx context.Context, newTransactions types.TxSlots,
 	p.pending.resetAddedHashes()
 	p.baseFee.resetAddedHashes()
 	if addReasons, err := addTxs(p.lastSeenBlock.Load(), cacheView, p.senders, newTxs,
-		p.pendingBaseFee.Load(), p.blockGasLimit.Load(), p.pending, p.baseFee, p.queued, p.all, p.byHash, p.addLocked, p.discardLocked); err == nil {
+		p.pendingBaseFee.Load(), p.blockGasLimit.Load(), p.pending, p.baseFee, p.queued, p.all, p.byHash, p.addLocked, p.discardLocked, p.l1Cost); err == nil {
 		for i, reason := range addReasons {
 			if reason != NotSet {
 				reasons[i] = reason
@@ -885,7 +968,8 @@ func (p *TxPool) cache() kvcache.Cache {
 func addTxs(blockNum uint64, cacheView kvcache.CacheView, senders *sendersBatch,
 	newTxs types.TxSlots, pendingBaseFee, blockGasLimit uint64,
 	pending *PendingPool, baseFee, queued *SubPool,
-	byNonce *BySenderAndNonce, byHash map[string]*metaTx, add func(*metaTx) DiscardReason, discard func(*metaTx, DiscardReason)) ([]DiscardReason, error) {
+	byNonce *BySenderAndNonce, byHash map[string]*metaTx, add func(*metaTx) DiscardReason, discard func(*metaTx, DiscardReason),
+	l1CostFn L1CostFn) ([]DiscardReason, error) {
 	protocolBaseFee := calcProtocolBaseFee(pendingBaseFee)
 	if ASSERT {
 		for _, txn := range newTxs.Txs {
@@ -942,7 +1026,7 @@ func addTxs(blockNum uint64, cacheView kvcache.CacheView, senders *sendersBatch,
 			return discardReasons, err
 		}
 		onSenderStateChange(senderID, nonce, balance, byNonce,
-			protocolBaseFee, blockGasLimit, pending, baseFee, queued, discard)
+			protocolBaseFee, blockGasLimit, pending, baseFee, queued, discard, l1CostFn)
 	}
 
 	promote(pending, baseFee, queued, pendingBaseFee, discard)
@@ -953,7 +1037,8 @@ func addTxs(blockNum uint64, cacheView kvcache.CacheView, senders *sendersBatch,
 func addTxsOnNewBlock(blockNum uint64, cacheView kvcache.CacheView, stateChanges *remote.StateChangeBatch,
 	senders *sendersBatch, newTxs types.TxSlots, pendingBaseFee uint64, blockGasLimit uint64,
 	pending *PendingPool, baseFee, queued *SubPool,
-	byNonce *BySenderAndNonce, byHash map[string]*metaTx, add func(*metaTx) DiscardReason, discard func(*metaTx, DiscardReason)) error {
+	byNonce *BySenderAndNonce, byHash map[string]*metaTx, add func(*metaTx) DiscardReason, discard func(*metaTx, DiscardReason),
+	l1CostFn L1CostFn) error {
 	protocolBaseFee := calcProtocolBaseFee(pendingBaseFee)
 	if ASSERT {
 		for _, txn := range newTxs.Txs {
@@ -1007,7 +1092,7 @@ func addTxsOnNewBlock(blockNum uint64, cacheView kvcache.CacheView, stateChanges
 			return err
 		}
 		onSenderStateChange(senderID, nonce, balance, byNonce,
-			protocolBaseFee, blockGasLimit, pending, baseFee, queued, discard)
+			protocolBaseFee, blockGasLimit, pending, baseFee, queued, discard, l1CostFn)
 	}
 
 	return nil
@@ -1161,7 +1246,7 @@ func removeMined(byNonce *BySenderAndNonce, minedTxs []*types.TxSlot, pending *P
 // nonces, and also affect other transactions from the same sender with higher nonce, it loops through all transactions
 // for a given senderID
 func onSenderStateChange(senderID uint64, senderNonce uint64, senderBalance uint256.Int, byNonce *BySenderAndNonce,
-	protocolBaseFee, blockGasLimit uint64, pending *PendingPool, baseFee, queued *SubPool, discard func(*metaTx, DiscardReason)) {
+	protocolBaseFee, blockGasLimit uint64, pending *PendingPool, baseFee, queued *SubPool, discard func(*metaTx, DiscardReason), l1CostFn L1CostFn) {
 	noGapsNonce := senderNonce
 	cumulativeRequiredBalance := uint256.NewInt(0)
 	minFeeCap := uint256.NewInt(0).SetAllOne()
@@ -1207,6 +1292,13 @@ func onSenderStateChange(senderID uint64, senderNonce uint64, senderBalance uint
 		needBalance := uint256.NewInt(mt.Tx.Gas)
 		needBalance.Mul(needBalance, &mt.Tx.FeeCap)
 		needBalance.Add(needBalance, &mt.Tx.Value)
+
+		if l1CostFn != nil {
+			if l1Cost := l1CostFn(mt.Tx); l1Cost != nil {
+				needBalance.Add(needBalance, l1Cost)
+			}
+		}
+
 		// 1. Minimum fee requirement. Set to 1 if feeCap of the transaction is no less than in-protocol
 		// parameter of minimal base fee. Set to 0 if feeCap is less than minimum base fee, which means
 		// this transaction will never be included into this particular chain.
@@ -1626,7 +1718,7 @@ func (p *TxPool) fromDB(ctx context.Context, tx kv.Tx, coreTx kv.Tx) error {
 		return err
 	}
 	if _, err := addTxs(p.lastSeenBlock.Load(), cacheView, p.senders, txs,
-		pendingBaseFee, math.MaxUint64 /* blockGasLimit */, p.pending, p.baseFee, p.queued, p.all, p.byHash, p.addLocked, p.discardLocked); err != nil {
+		pendingBaseFee, math.MaxUint64 /* blockGasLimit */, p.pending, p.baseFee, p.queued, p.all, p.byHash, p.addLocked, p.discardLocked, p.l1Cost); err != nil {
 		return err
 	}
 	p.pendingBaseFee.Store(pendingBaseFee)
