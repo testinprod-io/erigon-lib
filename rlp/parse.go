@@ -235,4 +235,9 @@ func ParseHash(payload []byte, pos int, hashbuf []byte) (int, error) {
 	return pos + 32, nil
 }
 
+func SkipString(payload []byte, pos int) (nextPos, dataLen int, err error) {
+	dataPos, dataLen, err := String(payload, pos)
+	return dataPos + dataLen, dataLen, err
+}
+
 const ParseHashErrorPrefix = "parse hash payload"
