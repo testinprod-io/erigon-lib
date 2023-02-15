@@ -99,6 +99,8 @@ type TxSlot struct {
 	Creation       bool     // Set to true if "To" field of the transaction is not set
 	Type           byte     // Transaction type
 	Size           uint32   // Size of the payload
+
+	RollupDataGas uint64 // Translates into a L1 cost based on fee parameters
 }
 
 const (
@@ -152,9 +154,10 @@ func (ctx *TxParseContext) ParseTransaction(payload []byte, pos int, slot *TxSlo
 
 	p = dataPos
 
+	var txType int
 	// If it is non-legacy transaction, the transaction type follows, and then the the list
 	if !legacy {
-		slot.Type = payload[p]
+		txType = int(payload[p])
 		if _, err = ctx.Keccak1.Write(payload[p : p+1]); err != nil {
 			return 0, fmt.Errorf("%w: computing IdHash (hashing type Prefix): %s", ErrParseTxn, err)
 		}

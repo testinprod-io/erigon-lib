@@ -88,6 +88,20 @@ type Config struct {
 	Aura   *AuRaConfig   `json:"aura,omitempty"`
 	Parlia *ParliaConfig `json:"parlia,omitempty" toml:",omitempty"`
 	Bor    *BorConfig    `json:"bor,omitempty"`
+
+	// Optimism config
+	Optimism *OptimismConfig `json:"optimism,omitempty"`
+}
+
+// OptimismConfig is the optimism config.
+type OptimismConfig struct {
+	BaseFeeRecipient common.Address `json:"baseFeeRecipient"`
+	L1FeeRecipient   common.Address `json:"l1FeeRecipient"`
+}
+
+// String implements the stringer interface, returning the optimism fee config details.
+func (o *OptimismConfig) String() string {
+	return "optimism"
 }
 
 func (c *Config) String() string {
