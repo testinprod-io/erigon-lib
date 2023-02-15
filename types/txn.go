@@ -105,6 +105,7 @@ const (
 	LegacyTxType     byte = 0
 	AccessListTxType byte = 1
 	DynamicFeeTxType byte = 2
+	DepositTxType    int  = 126
 )
 
 var ErrParseTxn = fmt.Errorf("%w transaction", rlp.ErrParse)
@@ -187,6 +188,82 @@ func (ctx *TxParseContext) ParseTransaction(payload []byte, pos int, slot *TxSlo
 		}
 	}
 
+	if txType == DepositTxType {
+		// SourchHash
+		p, _, err = rlp.SkipString(payload, p)
+		if err != nil {
+			return 0, fmt.Errorf("%w: depostTx sourchHash: %s", ErrParseTxn, err)
+		}
+		// From
+		dataPos, dataLen, err = rlp.String(payload, p)
+		if err != nil {
+			return 0, fmt.Errorf("%w: depostTx from: %s", ErrParseTxn, err)
+		}
+		if ctx.withSender {
+			copy(sender, payload[dataPos:dataPos+dataLen])
+		}
+		p = dataPos + dataLen
+		// To
+		p, dataLen, err = rlp.SkipString(payload, p)
+		if err != nil {
+			return 0, fmt.Errorf("%w: depostTx to: %s", ErrParseTxn, err)
+		}
+		slot.Creation = dataLen == 0
+		// Mint
+		p, _, err = rlp.SkipString(payload, p)
+		if err != nil {
+			return 0, fmt.Errorf("%w: depostTx mint: %s", ErrParseTxn, err)
+		}
+		// Value
+		p, err = rlp.U256(payload, p, &slot.Value)
+		if err != nil {
+			return 0, fmt.Errorf("%w: depostTx value: %s", ErrParseTxn, err)
+		}
+		// Gas
+		p, slot.Gas, err = rlp.U64(payload, p)
+		if err != nil {
+			return 0, fmt.Errorf("%w: depositTx gas: %s", ErrParseTxn, err)
+		}
+		// Data
+		dataPos, dataLen, err = rlp.String(payload, p)
+		if err != nil {
+			return 0, fmt.Errorf("%w: depositTx data len: %s", ErrParseTxn, err)
+		}
+		slot.DataLen = dataLen
+
+		// Zero and non-zero bytes are priced differently
+		slot.DataNonZeroLen = 0
+		for _, byt := range payload[dataPos : dataPos+dataLen] {
+			if byt != 0 {
+				slot.DataNonZeroLen++
+			}
+		}
+		{
+			// full tx contents count towards rollup data gas, not just tx data
+			var zeroes, ones uint64
+			for _, byt := range payload {
+				if byt == 0 {
+					zeroes++
+				} else {
+					ones++
+				}
+			}
+			zeroesGas := zeroes * 4
+			onesGas := (ones + 68) * 16
+			slot.RollupDataGas = zeroesGas + onesGas
+		}
+		p = dataPos + dataLen
+
+		// Set IDHash to slot
+		_, _ = ctx.Keccak1.(io.Reader).Read(slot.IDHash[:32])
+		if validateHash != nil {
+			if err := validateHash(slot.IDHash[:32]); err != nil {
+				return p, err
+			}
+		}
+		return p, nil
+	}
+
 	// Remember where signing hash data begins (it will need to be wrapped in an RLP list)
 	sigHashPos := p
 	if !legacy {
@@ -261,6 +338,20 @@ func (ctx *TxParseContext) ParseTransaction(payload []byte, pos int, slot *TxSlo
 		if byt != 0 {
 			slot.DataNonZeroLen++
 		}
+	}
+	{
+		// full tx contents count towards rollup data gas, not just tx data
+		var zeroes, ones uint64
+		for _, byt := range payload {
+			if byt == 0 {
+				zeroes++
+			} else {
+				ones++
+			}
+		}
+		zeroesGas := zeroes * 4
+		onesGas := (ones + 68) * 16
+		slot.RollupDataGas = zeroesGas + onesGas
 	}
 
 	p = dataPos + dataLen
