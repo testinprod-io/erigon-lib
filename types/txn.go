@@ -107,7 +107,7 @@ const (
 	LegacyTxType     byte = 0
 	AccessListTxType byte = 1
 	DynamicFeeTxType byte = 2
-	DepositTxType    int  = 126
+	DepositTxType    byte = 126
 )
 
 var ErrParseTxn = fmt.Errorf("%w transaction", rlp.ErrParse)
@@ -154,10 +154,10 @@ func (ctx *TxParseContext) ParseTransaction(payload []byte, pos int, slot *TxSlo
 
 	p = dataPos
 
-	var txType int
+	var txType byte
 	// If it is non-legacy transaction, the transaction type follows, and then the the list
 	if !legacy {
-		txType = int(payload[p])
+		txType = payload[p]
 		if _, err = ctx.Keccak1.Write(payload[p : p+1]); err != nil {
 			return 0, fmt.Errorf("%w: computing IdHash (hashing type Prefix): %s", ErrParseTxn, err)
 		}
