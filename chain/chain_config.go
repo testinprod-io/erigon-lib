@@ -90,7 +90,8 @@ type Config struct {
 	Bor    *BorConfig    `json:"bor,omitempty"`
 
 	// Optimism config
-	Optimism *OptimismConfig `json:"optimism,omitempty"`
+	Optimism     *OptimismConfig `json:"optimism,omitempty"`
+	BedrockBlock *big.Int        `json:"bedrockBlock,omitempty"`
 }
 
 // OptimismConfig is the optimism config.
@@ -323,6 +324,26 @@ func (c *Config) IsCancun(time uint64) bool {
 
 func (c *Config) IsEip1559FeeCollector(num uint64) bool {
 	return c.Eip1559FeeCollector != nil && isForked(c.Eip1559FeeCollectorTransition, num)
+}
+
+// IsBedrock returns whether num is either equal to the Bedrock fork block or greater.
+func (c *Config) IsBedrock(num uint64) bool {
+	return isForked(c.BedrockBlock, num)
+}
+
+// IsOptimism returns whether the node is an optimism node or not.
+func (c *Config) IsOptimism() bool {
+	return c.Optimism != nil
+}
+
+// IsOptimismBedrock returns true iff this is an optimism node & bedrock is active
+func (c *Config) IsOptimismBedrock(num uint64) bool {
+	return c.IsOptimism() && c.IsBedrock(num)
+}
+
+// IsOptimismPreBedrock returns true iff this is an optimism node & bedrock is not yet active
+func (c *Config) IsOptimismPreBedrock(num uint64) bool {
+	return c.IsOptimism() && !c.IsBedrock(num)
 }
 
 // CheckCompatible checks whether scheduled fork transitions have been imported
@@ -669,6 +690,7 @@ type Rules struct {
 	IsNano, IsMoran, IsGibbs                                bool
 	IsEip1559FeeCollector                                   bool
 	IsParlia, IsAura                                        bool
+	IsOptimismBedrock                                       bool
 }
 
 // Rules ensures c's ChainID is not nil and returns a new Rules instance
@@ -696,6 +718,7 @@ func (c *Config) Rules(num uint64, time uint64) *Rules {
 		IsEip1559FeeCollector: c.IsEip1559FeeCollector(num),
 		IsParlia:              c.Parlia != nil,
 		IsAura:                c.Aura != nil,
+		IsOptimismBedrock:     c.IsOptimismBedrock(num),
 	}
 }
 
