@@ -91,7 +91,8 @@ type Config struct {
 	Bor    *BorConfig    `json:"bor,omitempty"`
 
 	// Optimism config
-	Optimism *OptimismConfig `json:"optimism,omitempty"`
+	Optimism     *OptimismConfig `json:"optimism,omitempty"`
+	BedrockBlock *big.Int        `json:"bedrockBlock,omitempty"`
 }
 
 // OptimismConfig is the optimism config.
@@ -690,6 +691,7 @@ type Rules struct {
 	IsNano, IsMoran, IsGibbs                                bool
 	IsEip1559FeeCollector                                   bool
 	IsParlia, IsAura                                        bool
+	IsOptimismBedrock                                       bool
 }
 
 // Rules ensures c's ChainID is not nil and returns a new Rules instance
@@ -717,6 +719,7 @@ func (c *Config) Rules(num uint64, time uint64) *Rules {
 		IsEip1559FeeCollector: c.IsEip1559FeeCollector(num),
 		IsParlia:              c.Parlia != nil,
 		IsAura:                c.Aura != nil,
+		IsOptimismBedrock:     c.IsOptimismBedrock(num),
 	}
 }
 
