@@ -347,19 +347,19 @@ func (c *Config) IsOptimismPreBedrock(num uint64) bool {
 }
 
 // BaseFeeChangeDenominator bounds the amount the base fee can change between blocks.
-func (c *Config) BaseFeeChangeDenominator(defaultParam int) int {
+func (c *Config) BaseFeeChangeDenominator(defaultParam int) uint64 {
 	if c.IsOptimism() {
-		return int(c.Optimism.EIP1559Denominator)
+		return c.Optimism.EIP1559Denominator
 	}
-	return defaultParam
+	return uint64(defaultParam)
 }
 
 // ElasticityMultiplier bounds the maximum gas limit an EIP-1559 block may have.
-func (c *Config) ElasticityMultiplier(defaultParam int) int {
+func (c *Config) ElasticityMultiplier(defaultParam int) uint64 {
 	if c.IsOptimism() {
-		return int(c.Optimism.EIP1559Elasticity)
+		return c.Optimism.EIP1559Elasticity
 	}
-	return defaultParam
+	return uint64(defaultParam)
 }
 
 // CheckCompatible checks whether scheduled fork transitions have been imported
