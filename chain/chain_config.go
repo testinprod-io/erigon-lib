@@ -96,8 +96,8 @@ type Config struct {
 
 // OptimismConfig is the optimism config.
 type OptimismConfig struct {
-	BaseFeeRecipient common.Address `json:"baseFeeRecipient"`
-	L1FeeRecipient   common.Address `json:"l1FeeRecipient"`
+	EIP1559Elasticity  uint64 `json:"eip1559Elasticity"`
+	EIP1559Denominator uint64 `json:"eip1559Denominator"`
 }
 
 // String implements the stringer interface, returning the optimism fee config details.
@@ -344,6 +344,22 @@ func (c *Config) IsOptimismBedrock(num uint64) bool {
 // IsOptimismPreBedrock returns true iff this is an optimism node & bedrock is not yet active
 func (c *Config) IsOptimismPreBedrock(num uint64) bool {
 	return c.IsOptimism() && !c.IsBedrock(num)
+}
+
+// BaseFeeChangeDenominator bounds the amount the base fee can change between blocks.
+func (c *Config) BaseFeeChangeDenominator(defaultParam int) int {
+	if c.IsOptimism() {
+		return int(c.Optimism.EIP1559Denominator)
+	}
+	return defaultParam
+}
+
+// ElasticityMultiplier bounds the maximum gas limit an EIP-1559 block may have.
+func (c *Config) ElasticityMultiplier(defaultParam int) int {
+	if c.IsOptimism() {
+		return int(c.Optimism.EIP1559Elasticity)
+	}
+	return defaultParam
 }
 
 // CheckCompatible checks whether scheduled fork transitions have been imported
