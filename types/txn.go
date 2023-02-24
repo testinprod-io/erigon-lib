@@ -154,10 +154,9 @@ func (ctx *TxParseContext) ParseTransaction(payload []byte, pos int, slot *TxSlo
 
 	p = dataPos
 
-	var txType byte
 	// If it is non-legacy transaction, the transaction type follows, and then the the list
 	if !legacy {
-		txType = payload[p]
+		slot.Type = payload[p]
 		if _, err = ctx.Keccak1.Write(payload[p : p+1]); err != nil {
 			return 0, fmt.Errorf("%w: computing IdHash (hashing type Prefix): %s", ErrParseTxn, err)
 		}
@@ -191,7 +190,7 @@ func (ctx *TxParseContext) ParseTransaction(payload []byte, pos int, slot *TxSlo
 		}
 	}
 
-	if txType == DepositTxType {
+	if slot.Type == DepositTxType {
 		// SourchHash
 		p, _, err = rlp.SkipString(payload, p)
 		if err != nil {
