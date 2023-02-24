@@ -91,8 +91,7 @@ type Config struct {
 	Bor    *BorConfig    `json:"bor,omitempty"`
 
 	// Optimism config
-	Optimism     *OptimismConfig `json:"optimism,omitempty"`
-	BedrockBlock *big.Int        `json:"bedrockBlock,omitempty"`
+	Optimism *OptimismConfig `json:"optimism,omitempty"`
 }
 
 // OptimismConfig is the optimism config.
