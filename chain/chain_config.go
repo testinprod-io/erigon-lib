@@ -66,6 +66,7 @@ type Config struct {
 	CancunTime       *big.Int `json:"cancunTime,omitempty"`       // Cancun switch time (nil = no fork, 0 = already activated)
 	ShardingForkTime *big.Int `json:"shardingForkTime,omitempty"` // Mini-Danksharding switch block (nil = no fork, 0 = already activated)
 	BedrockBlock     *big.Int `json:"bedrockBlock,omitempty"`     // Bedrock switch block (nil = no fork, 0 = already on optimism bedrock)
+	RegolithTime     *big.Int `json:"regolithTime,omitempty"`     // Regolith switch time (nil = no fork, 0 = already on optimism regolith)
 
 	// Parlia fork blocks
 	RamanujanBlock  *big.Int `json:"ramanujanBlock,omitempty" toml:",omitempty"`  // ramanujanBlock switch block (nil = no fork, 0 = already activated)
@@ -331,6 +332,10 @@ func (c *Config) IsBedrock(num uint64) bool {
 	return isForked(c.BedrockBlock, num)
 }
 
+func (c *Config) IsRegolith(time uint64) bool {
+	return isForked(c.RegolithTime, time)
+}
+
 // IsOptimism returns whether the node is an optimism node or not.
 func (c *Config) IsOptimism() bool {
 	return c.Optimism != nil
@@ -339,6 +344,10 @@ func (c *Config) IsOptimism() bool {
 // IsOptimismBedrock returns true iff this is an optimism node & bedrock is active
 func (c *Config) IsOptimismBedrock(num uint64) bool {
 	return c.IsOptimism() && c.IsBedrock(num)
+}
+
+func (c *Config) IsOptimismRegolith(time uint64) bool {
+	return c.IsOptimism() && c.IsRegolith(time)
 }
 
 // IsOptimismPreBedrock returns true iff this is an optimism node & bedrock is not yet active
