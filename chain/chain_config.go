@@ -715,7 +715,7 @@ type Rules struct {
 	IsNano, IsMoran, IsGibbs                                bool
 	IsEip1559FeeCollector                                   bool
 	IsParlia, IsAura                                        bool
-	IsOptimismBedrock                                       bool
+	IsOptimismBedrock, IsOptimismRegolith                   bool
 }
 
 // Rules ensures c's ChainID is not nil and returns a new Rules instance
@@ -744,6 +744,7 @@ func (c *Config) Rules(num uint64, time uint64) *Rules {
 		IsParlia:              c.Parlia != nil,
 		IsAura:                c.Aura != nil,
 		IsOptimismBedrock:     c.IsOptimismBedrock(num),
+		IsOptimismRegolith:    c.IsOptimismRegolith(time),
 	}
 }
 
