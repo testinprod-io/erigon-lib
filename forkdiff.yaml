@@ -1,0 +1,47 @@
+title: "op-erigon-lib"  # Define the HTML page title
+footer: |  # define the footer with markdown
+  Fork-diff overview of [op-erigon-lib](https://github.com/testinprod-io/erigon-lib), a fork of [erigon-lib](https://github.com/ledgerwatch/erigon-lib).
+base:
+  name: ledgerwatch/erigon-lib
+  url: https://github.com/ledgerwatch/erigon-lib
+  hash: 1a14cfd7e7641ddcd82bb9401aa54a21a725c94d
+fork:
+  name: testinprod-io/erigon-lib
+  url: https://github.com/testinprod-io/erigon-lib
+  ref: refs/heads/op-erigon
+def:
+  title: "op-erigon-lib"
+  description: | # description in markdown
+    This is an overview of the changes in [op-erigon-lib](https://github.com/testinprod-io/erigon-lib), a fork of [erigon-lib](https://github.com/ledgerwatch/erigon-lib),
+  sub:
+    - title: "Chain config"
+      globs:
+        - "chain/chain_config.go"
+    - title: "Deposit Tx & L1 cost computation"
+      globs:
+        - "rlp/parse.go"
+        - "txpool/pool.go"
+        - "types/txn.go"
+    - title: "Generated files"
+      globs:
+        - "gointerfaces/downloader/downloader.pb.go"
+        - "gointerfaces/downloader/downloader_grpc.pb.go"
+        - "gointerfaces/execution/execution.pb.go"
+        - "gointerfaces/execution/execution_grpc.pb.go"
+        - "gointerfaces/remote/ethbackend.pb.go"
+        - "gointerfaces/remote/ethbackend_grpc.pb.go"
+        - "gointerfaces/remote/kv.pb.go"
+        - "gointerfaces/remote/kv_grpc.pb.go"
+        - "gointerfaces/sentinel/sentinel.pb.go"
+        - "gointerfaces/sentinel/sentinel_grpc.pb.go"
+        - "gointerfaces/sentry/sentry.pb.go"
+        - "gointerfaces/sentry/sentry_grpc.pb.go"
+        - "gointerfaces/txpool/mining.pb.go"
+        - "gointerfaces/txpool/mining_grpc.pb.go"
+        - "gointerfaces/txpool/txpool.pb.go"
+        - "gointerfaces/txpool/txpool_grpc.pb.go"
+        - "gointerfaces/types/types.pb.go"
+# files can be ignored globally, these will be listed in a separate grayed-out section,
+# and do not count towards the total line count.
+ignore:
+  - "*.sum"
