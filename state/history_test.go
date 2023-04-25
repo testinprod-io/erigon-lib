@@ -23,7 +23,6 @@ import (
 	"math"
 	"strings"
 	"testing"
-	"testing/fstest"
 	"time"
 
 	"github.com/ledgerwatch/erigon-lib/kv"
@@ -72,7 +71,7 @@ func TestHistoryCollationBuild(t *testing.T) {
 	require.NoError(err)
 	defer tx.Rollback()
 	h.SetTx(tx)
-	h.StartWrites("")
+	h.StartWrites()
 	defer h.FinishWrites()
 
 	h.SetTxNum(2)
@@ -176,7 +175,7 @@ func TestHistoryAfterPrune(t *testing.T) {
 	require.NoError(t, err)
 	defer tx.Rollback()
 	h.SetTx(tx)
-	h.StartWrites("")
+	h.StartWrites()
 	defer h.FinishWrites()
 
 	h.SetTxNum(2)
@@ -234,7 +233,7 @@ func filledHistory(tb testing.TB) (string, kv.RwDB, *History, uint64) {
 	require.NoError(tb, err)
 	defer tx.Rollback()
 	h.SetTx(tx)
-	h.StartWrites("")
+	h.StartWrites()
 	defer h.FinishWrites()
 
 	txs := uint64(1000)
@@ -337,40 +336,50 @@ func TestHistoryHistory(t *testing.T) {
 
 func collateAndMergeHistory(tb testing.TB, db kv.RwDB, h *History, txs uint64) {
 	tb.Helper()
+	require := require.New(tb)
 
 	logEvery := time.NewTicker(30 * time.Second)
 	defer logEvery.Stop()
 	ctx := context.Background()
-	tx, err := db.BeginRwAsync(ctx)
-	require.NoError(tb, err)
+	tx, err := db.BeginRwNosync(ctx)
+	require.NoError(err)
 	h.SetTx(tx)
 	defer tx.Rollback()
+
 	// Leave the last 2 aggregation steps un-collated
 	for step := uint64(0); step < txs/h.aggregationStep-1; step++ {
-		func() {
-			c, err := h.collate(step, step*h.aggregationStep, (step+1)*h.aggregationStep, tx, logEvery)
-			require.NoError(tb, err)
-			sf, err := h.buildFiles(ctx, step, c)
-			require.NoError(tb, err)
-			h.integrateFiles(sf, step*h.aggregationStep, (step+1)*h.aggregationStep)
-			err = h.prune(ctx, step*h.aggregationStep, (step+1)*h.aggregationStep, math.MaxUint64, logEvery)
-			require.NoError(tb, err)
-			var r HistoryRanges
-			maxEndTxNum := h.endTxNumMinimax()
-			maxSpan := uint64(16 * 16)
+		c, err := h.collate(step, step*h.aggregationStep, (step+1)*h.aggregationStep, tx, logEvery)
+		require.NoError(err)
+		sf, err := h.buildFiles(ctx, step, c)
+		require.NoError(err)
+		h.integrateFiles(sf, step*h.aggregationStep, (step+1)*h.aggregationStep)
+		err = h.prune(ctx, step*h.aggregationStep, (step+1)*h.aggregationStep, math.MaxUint64, logEvery)
+		require.NoError(err)
+	}
 
-			for r = h.findMergeRange(maxEndTxNum, maxSpan); r.any(); r = h.findMergeRange(maxEndTxNum, maxSpan) {
-				hc := h.MakeContext()
-				indexOuts, historyOuts, _ := h.staticFilesInRange(r, hc)
-				indexIn, historyIn, err := h.mergeFiles(ctx, indexOuts, historyOuts, r, 1)
-				require.NoError(tb, err)
-				h.integrateMergedFiles(indexOuts, historyOuts, indexIn, historyIn)
-				hc.Close()
-			}
+	var r HistoryRanges
+	maxEndTxNum := h.endTxNumMinimax()
+
+	maxSpan := h.aggregationStep * StepsInBiggestFile
+
+	for r = h.findMergeRange(maxEndTxNum, maxSpan); r.any(); r = h.findMergeRange(maxEndTxNum, maxSpan) {
+		func() {
+			hc := h.MakeContext()
+			defer hc.Close()
+
+			indexOuts, historyOuts, _, err := h.staticFilesInRange(r, hc)
+			require.NoError(err)
+			indexIn, historyIn, err := h.mergeFiles(ctx, indexOuts, historyOuts, r, 1)
+			require.NoError(err)
+			h.integrateMergedFiles(indexOuts, historyOuts, indexIn, historyIn)
 		}()
 	}
+
+	err = h.BuildOptionalMissedIndices(ctx)
+	require.NoError(err)
+
 	err = tx.Commit()
-	require.NoError(tb, err)
+	require.NoError(err)
 }
 
 func TestHistoryMergeFiles(t *testing.T) {
@@ -381,16 +390,16 @@ func TestHistoryMergeFiles(t *testing.T) {
 }
 
 func TestHistoryScanFiles(t *testing.T) {
-	path, db, h, txs := filledHistory(t)
+	_, db, h, txs := filledHistory(t)
 	var err error
 
 	collateAndMergeHistory(t, db, h, txs)
 	// Recreate domain and re-scan the files
 	txNum := h.txNum
-	h.Close()
-	h, err = NewHistory(path, path, h.aggregationStep, h.filenameBase, h.indexKeysTable, h.indexTable, h.historyValsTable, h.settingsTable, h.compressVals, nil)
+	require.NoError(t, h.OpenFolder())
+	//h.Close()
+	//h, err = NewHistory(path, path, h.aggregationStep, h.filenameBase, h.indexKeysTable, h.indexTable, h.historyValsTable, h.settingsTable, h.compressVals, nil)
 	require.NoError(t, err)
-	defer h.Close()
 	h.SetTxNum(txNum)
 	// Check the history
 	checkHistoryHistory(t, db, h, txs)
@@ -616,30 +625,20 @@ func TestScanStaticFilesH(t *testing.T) {
 	h := &History{InvertedIndex: &InvertedIndex{filenameBase: "test", aggregationStep: 1},
 		files: btree2.NewBTreeG[*filesItem](filesItemLess),
 	}
-	ffs := fstest.MapFS{
-		"test.0-1.v": {},
-		"test.1-2.v": {},
-		"test.0-4.v": {},
-		"test.2-3.v": {},
-		"test.3-4.v": {},
-		"test.4-5.v": {},
+	files := []string{
+		"test.0-1.v",
+		"test.1-2.v",
+		"test.0-4.v",
+		"test.2-3.v",
+		"test.3-4.v",
+		"test.4-5.v",
 	}
-	files, err := ffs.ReadDir(".")
-	require.NoError(t, err)
-	h.scanStateFiles(files, nil)
-	var found []string
-	h.files.Walk(func(items []*filesItem) bool {
-		for _, item := range items {
-			found = append(found, fmt.Sprintf("%d-%d", item.startTxNum, item.endTxNum))
-		}
-		return true
-	})
-	require.Equal(t, 2, len(found))
-	require.Equal(t, "0-4", found[0])
-	require.Equal(t, "4-5", found[1])
+	h.scanStateFiles(files)
+	require.Equal(t, 6, h.files.Len())
 
 	h.files.Clear()
-	h.scanStateFiles(files, []string{"kv"})
+	h.integrityFileExtensions = []string{"kv"}
+	h.scanStateFiles(files)
 	require.Equal(t, 0, h.files.Len())
 
 }

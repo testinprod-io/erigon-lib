@@ -114,6 +114,64 @@ func NewAggregator(
 	return a, nil
 }
 
+func (a *Aggregator) ReopenFolder() error {
+	var err error
+	if err = a.accounts.OpenFolder(); err != nil {
+		return fmt.Errorf("OpenFolder: %w", err)
+	}
+	if err = a.storage.OpenFolder(); err != nil {
+		return fmt.Errorf("OpenFolder: %w", err)
+	}
+	if err = a.code.OpenFolder(); err != nil {
+		return fmt.Errorf("OpenFolder: %w", err)
+	}
+	if err = a.commitment.OpenFolder(); err != nil {
+		return fmt.Errorf("OpenFolder: %w", err)
+	}
+	if err = a.logAddrs.OpenFolder(); err != nil {
+		return fmt.Errorf("OpenFolder: %w", err)
+	}
+	if err = a.logTopics.OpenFolder(); err != nil {
+		return fmt.Errorf("OpenFolder: %w", err)
+	}
+	if err = a.tracesFrom.OpenFolder(); err != nil {
+		return fmt.Errorf("OpenFolder: %w", err)
+	}
+	if err = a.tracesTo.OpenFolder(); err != nil {
+		return fmt.Errorf("OpenFolder: %w", err)
+	}
+	return nil
+}
+
+func (a *Aggregator) ReopenList(fNames []string) error {
+	var err error
+	if err = a.accounts.OpenList(fNames); err != nil {
+		return err
+	}
+	if err = a.storage.OpenList(fNames); err != nil {
+		return err
+	}
+	if err = a.code.OpenList(fNames); err != nil {
+		return err
+	}
+	if err = a.commitment.OpenList(fNames); err != nil {
+		return err
+	}
+	if err = a.logAddrs.OpenList(fNames); err != nil {
+		return err
+	}
+	if err = a.logTopics.OpenList(fNames); err != nil {
+		return err
+	}
+	if err = a.tracesFrom.OpenList(fNames); err != nil {
+		return err
+	}
+	if err = a.tracesTo.OpenList(fNames); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (a *Aggregator) GetAndResetStats() DomainStats {
 	stats := DomainStats{}
 	stats.Accumulate(a.accounts.GetAndResetStats())
@@ -190,14 +248,14 @@ func (a *Aggregator) SetTxNum(txNum uint64) {
 func (a *Aggregator) SetBlockNum(bn uint64) { a.blockNum = bn }
 
 func (a *Aggregator) SetWorkers(i int) {
-	a.accounts.workers = i
-	a.storage.workers = i
-	a.code.workers = i
-	a.commitment.workers = i
-	a.logAddrs.workers = i
-	a.logTopics.workers = i
-	a.tracesFrom.workers = i
-	a.tracesTo.workers = i
+	a.accounts.compressWorkers = i
+	a.storage.compressWorkers = i
+	a.code.compressWorkers = i
+	a.commitment.compressWorkers = i
+	a.logAddrs.compressWorkers = i
+	a.logTopics.compressWorkers = i
+	a.tracesFrom.compressWorkers = i
+	a.tracesTo.compressWorkers = i
 }
 
 func (a *Aggregator) SetCommitmentMode(mode CommitmentMode) {
@@ -373,6 +431,7 @@ func (a *Aggregator) mergeLoopStep(ctx context.Context, maxEndTxNum uint64, work
 		}
 	}()
 	a.integrateMergedFiles(outs, in)
+	a.cleanAfterFreeze(in)
 	closeAll = false
 	return true, nil
 }
@@ -649,7 +708,16 @@ func (a *Aggregator) integrateMergedFiles(outs SelectedStaticFiles, in MergedFil
 	a.tracesFrom.integrateMergedFiles(outs.tracesFrom, in.tracesFrom)
 	a.tracesTo.integrateMergedFiles(outs.tracesTo, in.tracesTo)
 }
-
+func (a *Aggregator) cleanAfterFreeze(in MergedFiles) {
+	a.accounts.cleanAfterFreeze(in.accountsHist)
+	a.storage.cleanAfterFreeze(in.storageHist)
+	a.code.cleanAfterFreeze(in.codeHist)
+	a.commitment.cleanAfterFreeze(in.commitment)
+	a.logAddrs.cleanFrozenParts(in.logAddrs)
+	a.logTopics.cleanFrozenParts(in.logTopics)
+	a.tracesFrom.cleanFrozenParts(in.tracesFrom)
+	a.tracesTo.cleanFrozenParts(in.tracesTo)
+}
 func (ac *AggregatorContext) ReadAccountData(addr []byte, roTx kv.Tx) ([]byte, error) {
 	return ac.accounts.Get(addr, nil, roTx)
 }
@@ -945,14 +1013,14 @@ func (ac *AggregatorContext) TraceToIterator(addr []byte, startTxNum, endTxNum i
 
 // StartWrites - pattern: `defer agg.StartWrites().FinishWrites()`
 func (a *Aggregator) StartWrites() *Aggregator {
-	a.accounts.StartWrites(a.tmpdir)
-	a.storage.StartWrites(a.tmpdir)
-	a.code.StartWrites(a.tmpdir)
-	a.commitment.StartWrites(a.tmpdir)
-	a.logAddrs.StartWrites(a.tmpdir)
-	a.logTopics.StartWrites(a.tmpdir)
-	a.tracesFrom.StartWrites(a.tmpdir)
-	a.tracesTo.StartWrites(a.tmpdir)
+	a.accounts.StartWrites()
+	a.storage.StartWrites()
+	a.code.StartWrites()
+	a.commitment.StartWrites()
+	a.logAddrs.StartWrites()
+	a.logTopics.StartWrites()
+	a.tracesFrom.StartWrites()
+	a.tracesTo.StartWrites()
 	return a
 }
 func (a *Aggregator) FinishWrites() {
