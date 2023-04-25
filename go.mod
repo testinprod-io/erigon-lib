@@ -2,10 +2,10 @@ module github.com/ledgerwatch/erigon-lib
 
 go 1.18
 
-replace github.com/ledgerwatch/interfaces v0.0.0-20230201210041-46fc5eaf2814 => github.com/testinprod-io/erigon-interfaces v0.0.0-20230216013755-f370bfb8f01b
+replace github.com/ledgerwatch/interfaces v0.0.0-20230210062155-539b8171d9f0 => github.com/testinprod-io/erigon-interfaces v0.0.0-20230425002922-9c19004b61ca
 
 //for local dev:
-//replace github.com/ledgerwatch/interfaces v0.0.0-20230201210041-46fc5eaf2814 => ../erigon-interfaces
+//replace github.com/ledgerwatch/interfaces v0.0.0-20230210062155-539b8171d9f0 => ../erigon-interfaces
 
 require (
 	github.com/ledgerwatch/interfaces v0.0.0-20230210062155-539b8171d9f0
