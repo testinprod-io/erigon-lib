@@ -5,11 +5,13 @@ on:
       - main
       - stable
       - alpha
+      - op-erigon
   pull_request:
     branches:
       - main
       - stable
       - alpha
+      - op-erigon
 env:
   CGO_ENABLED: "1"
   CGO_CXXFLAGS: "-g -O2 -std=c++17"
