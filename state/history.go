@@ -27,10 +27,15 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/RoaringBitmap/roaring/roaring64"
+	"github.com/ledgerwatch/log/v3"
+	btree2 "github.com/tidwall/btree"
+	atomic2 "go.uber.org/atomic"
+	"golang.org/x/exp/slices"
+	"golang.org/x/sync/errgroup"
+
 	"github.com/ledgerwatch/erigon-lib/common"
 	"github.com/ledgerwatch/erigon-lib/common/cmp"
 	"github.com/ledgerwatch/erigon-lib/common/dir"
@@ -41,11 +46,6 @@ import (
 	"github.com/ledgerwatch/erigon-lib/kv/order"
 	"github.com/ledgerwatch/erigon-lib/recsplit"
 	"github.com/ledgerwatch/erigon-lib/recsplit/eliasfano32"
-	"github.com/ledgerwatch/log/v3"
-	btree2 "github.com/tidwall/btree"
-	atomic2 "go.uber.org/atomic"
-	"golang.org/x/exp/slices"
-	"golang.org/x/sync/errgroup"
 )
 
 type History struct {
@@ -66,8 +66,7 @@ type History struct {
 	compressVals            bool
 	integrityFileExtensions []string
 
-	wal     *historyWAL
-	walLock sync.RWMutex
+	wal *historyWAL
 }
 
 func NewHistory(
@@ -468,35 +467,24 @@ func buildVi(ctx context.Context, historyItem, iiItem *filesItem, historyIdxPath
 }
 
 func (h *History) AddPrevValue(key1, key2, original []byte) (err error) {
-	h.walLock.RLock() // read-lock for reading fielw `w` and writing into it, write-lock for setting new `w`
-	err = h.wal.addPrevValue(key1, key2, original)
-	h.walLock.RUnlock()
-	return err
+	return h.wal.addPrevValue(key1, key2, original)
 }
 
 func (h *History) DiscardHistory() {
 	h.InvertedIndex.StartWrites()
-	h.walLock.Lock()
-	defer h.walLock.Unlock()
 	h.wal = h.newWriter(h.tmpdir, false, true)
 }
 func (h *History) StartWrites() {
 	h.InvertedIndex.StartWrites()
-	h.walLock.Lock()
-	defer h.walLock.Unlock()
 	h.wal = h.newWriter(h.tmpdir, true, false)
 }
 func (h *History) FinishWrites() {
 	h.InvertedIndex.FinishWrites()
-	h.walLock.Lock()
-	defer h.walLock.Unlock()
 	h.wal.close()
 	h.wal = nil
 }
 
 func (h *History) Rotate() historyFlusher {
-	h.walLock.Lock()
-	defer h.walLock.Unlock()
 	if h.wal != nil {
 		h.wal.historyValsFlushing, h.wal.historyVals = h.wal.historyVals, h.wal.historyValsFlushing
 		h.wal.autoIncrementFlush = h.wal.autoIncrement
@@ -1202,7 +1190,7 @@ func (hc *HistoryContext) statelessIdxReader(i int) *recsplit.IndexReader {
 	}
 	r := hc.readers[i]
 	if r == nil {
-		r = recsplit.NewIndexReader(hc.files[i].src.index)
+		r = hc.files[i].src.index.GetReaderFromPool()
 		hc.readers[i] = r
 	}
 	return r
@@ -1220,6 +1208,10 @@ func (hc *HistoryContext) Close() {
 			item.src.closeFilesAndRemove()
 		}
 	}
+	for _, r := range hc.readers {
+		r.Close()
+	}
+
 }
 
 func (hc *HistoryContext) getFile(from, to uint64) (it ctxItem, ok bool) {
@@ -1232,7 +1224,7 @@ func (hc *HistoryContext) getFile(from, to uint64) (it ctxItem, ok bool) {
 }
 
 func (hc *HistoryContext) GetNoState(key []byte, txNum uint64) ([]byte, bool, error) {
-	exactStep1, exactStep2, lastIndexedTxNum, foundExactShard1, foundExactShard2 := hc.h.localityIndex.lookupIdxFiles(hc.ic.loc.reader, hc.ic.loc.bm, hc.ic.loc.file, key, txNum)
+	exactStep1, exactStep2, lastIndexedTxNum, foundExactShard1, foundExactShard2 := hc.h.localityIndex.lookupIdxFiles(hc.ic.loc, key, txNum)
 
 	//fmt.Printf("GetNoState [%x] %d\n", key, txNum)
 	var foundTxNum uint64

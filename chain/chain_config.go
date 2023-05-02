@@ -67,6 +67,7 @@ type Config struct {
 	ShardingForkTime *big.Int `json:"shardingForkTime,omitempty"` // Mini-Danksharding switch block (nil = no fork, 0 = already activated)
 	BedrockBlock     *big.Int `json:"bedrockBlock,omitempty"`     // Bedrock switch block (nil = no fork, 0 = already on optimism bedrock)
 	RegolithTime     *big.Int `json:"regolithTime,omitempty"`     // Regolith switch time (nil = no fork, 0 = already on optimism regolith)
+	PragueTime       *big.Int `json:"pragueTime,omitempty"`       // Prague switch time (nil = no fork, 0 = already activated)
 
 	// Parlia fork blocks
 	RamanujanBlock  *big.Int `json:"ramanujanBlock,omitempty" toml:",omitempty"`  // ramanujanBlock switch block (nil = no fork, 0 = already activated)
@@ -125,7 +126,7 @@ func (c *Config) String() string {
 		)
 	}
 
-	return fmt.Sprintf("{ChainID: %v, Homestead: %v, DAO: %v, DAO Support: %v, Tangerine Whistle: %v, Spurious Dragon: %v, Byzantium: %v, Constantinople: %v, Petersburg: %v, Istanbul: %v, Muir Glacier: %v, Berlin: %v, London: %v, Arrow Glacier: %v, Gray Glacier: %v, Terminal Total Difficulty: %v, Merge Netsplit: %v, Shanghai: %v, Cancun: %v, Engine: %v}",
+	return fmt.Sprintf("{ChainID: %v, Homestead: %v, DAO: %v, DAO Support: %v, Tangerine Whistle: %v, Spurious Dragon: %v, Byzantium: %v, Constantinople: %v, Petersburg: %v, Istanbul: %v, Muir Glacier: %v, Berlin: %v, London: %v, Arrow Glacier: %v, Gray Glacier: %v, Terminal Total Difficulty: %v, Merge Netsplit: %v, Shanghai: %v, Cancun: %v, Sharding: %v, Prague: %v, Engine: %v}",
 		c.ChainID,
 		c.HomesteadBlock,
 		c.DAOForkBlock,
@@ -145,6 +146,8 @@ func (c *Config) String() string {
 		c.MergeNetsplitBlock,
 		c.ShanghaiTime,
 		c.CancunTime,
+		c.ShardingForkTime,
+		c.PragueTime,
 		engine,
 	)
 }
@@ -321,6 +324,11 @@ func (c *Config) IsSharding(time uint64) bool {
 // IsCancun returns whether time is either equal to the Cancun fork time or greater.
 func (c *Config) IsCancun(time uint64) bool {
 	return isForked(c.CancunTime, time)
+}
+
+// IsPrague returns whether time is either equal to the Prague fork time or greater.
+func (c *Config) IsPrague(time uint64) bool {
+	return isForked(c.PragueTime, time)
 }
 
 func (c *Config) IsEip1559FeeCollector(num uint64) bool {
@@ -632,8 +640,9 @@ type BorConfig struct {
 	OverrideStateSyncRecords map[string]int         `json:"overrideStateSyncRecords"` // override state records count
 	BlockAlloc               map[string]interface{} `json:"blockAlloc"`
 
-	JaipurBlock *big.Int `json:"jaipurBlock"` // Jaipur switch block (nil = no fork, 0 = already on jaipur)
-	DelhiBlock  *big.Int `json:"delhiBlock"`  // Delhi switch block (nil = no fork, 0 = already on delhi)
+	CalcuttaBlock *big.Int `json:"calcuttaBlock"` // Calcutta switch block (nil = no fork, 0 = already on calcutta)
+	JaipurBlock   *big.Int `json:"jaipurBlock"`   // Jaipur switch block (nil = no fork, 0 = already on jaipur)
+	DelhiBlock    *big.Int `json:"delhiBlock"`    // Delhi switch block (nil = no fork, 0 = already on delhi)
 }
 
 // String implements the stringer interface, returning the consensus engine details.
@@ -663,6 +672,14 @@ func (c *BorConfig) IsJaipur(number uint64) bool {
 
 func (c *BorConfig) IsDelhi(number uint64) bool {
 	return isForked(c.DelhiBlock, number)
+}
+
+func (c *BorConfig) IsCalcutta(number uint64) bool {
+	return isForked(c.CalcuttaBlock, number)
+}
+
+func (c *BorConfig) IsOnCalcutta(number *big.Int) bool {
+	return numEqual(c.CalcuttaBlock, number)
 }
 
 func (c *BorConfig) calcConfig(field map[string]uint64, number uint64) uint64 {
@@ -711,7 +728,7 @@ type Rules struct {
 	IsHomestead, IsTangerineWhistle, IsSpuriousDragon       bool
 	IsByzantium, IsConstantinople, IsPetersburg, IsIstanbul bool
 	IsBerlin, IsLondon, IsShanghai, IsCancun                bool
-	IsSharding                                              bool
+	IsSharding, IsPrague                                    bool
 	IsNano, IsMoran, IsGibbs                                bool
 	IsEip1559FeeCollector                                   bool
 	IsParlia, IsAura                                        bool
@@ -738,6 +755,8 @@ func (c *Config) Rules(num uint64, time uint64) *Rules {
 		IsLondon:              c.IsLondon(num),
 		IsShanghai:            c.IsShanghai(time),
 		IsCancun:              c.IsCancun(time),
+		IsSharding:            c.IsSharding(time),
+		IsPrague:              c.IsPrague(time),
 		IsNano:                c.IsNano(num),
 		IsMoran:               c.IsMoran(num),
 		IsEip1559FeeCollector: c.IsEip1559FeeCollector(num),
