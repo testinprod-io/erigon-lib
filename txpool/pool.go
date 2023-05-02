@@ -386,6 +386,9 @@ func RawRLPTxToOptimismL1CostFn(payload []byte) (L1CostFn, error) {
 		return nil, fmt.Errorf("empty tx payload")
 	}
 	offset, _, err := rlp.String(payload, 0)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse rlp string: %w", err)
+	}
 	if payload[offset] != 0x7E {
 		return nil, fmt.Errorf("expected deposit tx type, but got %d", payload[offset])
 	}
