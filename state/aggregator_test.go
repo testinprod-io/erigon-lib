@@ -1,7 +1,6 @@
 package state
 
 import (
-	"bytes"
 	"context"
 	"encoding/binary"
 	"fmt"
@@ -14,6 +13,7 @@ import (
 	"time"
 
 	"github.com/holiman/uint256"
+	"github.com/ledgerwatch/erigon-lib/common/background"
 	"github.com/ledgerwatch/log/v3"
 	"github.com/stretchr/testify/require"
 
@@ -23,7 +23,6 @@ import (
 	"github.com/ledgerwatch/erigon-lib/compress"
 	"github.com/ledgerwatch/erigon-lib/kv"
 	"github.com/ledgerwatch/erigon-lib/kv/mdbx"
-	"github.com/ledgerwatch/erigon-lib/recsplit"
 )
 
 func testDbAndAggregator(t *testing.T, aggStep uint64) (string, kv.RwDB, *Aggregator) {
@@ -81,7 +80,7 @@ func TestAggregator_WinAccess(t *testing.T) {
 }
 
 func TestAggregator_Merge(t *testing.T) {
-	_, db, agg := testDbAndAggregator(t, 100)
+	_, db, agg := testDbAndAggregator(t, 1000)
 	defer agg.Close()
 
 	tx, err := db.BeginRwNosync(context.Background())
@@ -239,7 +238,7 @@ func TestAggregator_RestartOnDatadir(t *testing.T) {
 
 	anotherAgg.SetTx(rwTx)
 	startTx := anotherAgg.EndTxNumMinimax()
-	sstartTx, err := anotherAgg.SeekCommitment()
+	_, sstartTx, err := anotherAgg.SeekCommitment()
 	require.NoError(t, err)
 	require.GreaterOrEqual(t, sstartTx, startTx)
 	require.GreaterOrEqual(t, sstartTx, latestCommitTxNum)
@@ -312,8 +311,6 @@ func TestAggregator_RestartOnFiles(t *testing.T) {
 	tx = nil
 	db.Close()
 	agg.Close()
-	db = nil
-	agg = nil
 
 	require.NoError(t, os.RemoveAll(filepath.Join(path, "db4")))
 
@@ -334,7 +331,7 @@ func TestAggregator_RestartOnFiles(t *testing.T) {
 	newAgg.SetTx(newTx)
 	newAgg.StartWrites()
 
-	latestTx, err := newAgg.SeekCommitment()
+	_, latestTx, err := newAgg.SeekCommitment()
 	require.NoError(t, err)
 	t.Logf("seek to latest_tx=%d", latestTx)
 
@@ -368,7 +365,7 @@ func TestAggregator_RestartOnFiles(t *testing.T) {
 }
 
 func TestAggregator_ReplaceCommittedKeys(t *testing.T) {
-	aggStep := uint64(10000)
+	aggStep := uint64(500)
 
 	_, db, agg := testDbAndAggregator(t, aggStep)
 	t.Cleanup(agg.Close)
@@ -397,7 +394,7 @@ func TestAggregator_ReplaceCommittedKeys(t *testing.T) {
 	}
 
 	roots := agg.AggregatedRoots()
-	txs := aggStep / 2 * 50
+	txs := (aggStep) * StepsInBiggestFile
 	t.Logf("step=%d tx_count=%d", aggStep, txs)
 
 	rnd := rand.New(rand.NewSource(0))
@@ -627,157 +624,11 @@ func Test_InitBtreeIndex(t *testing.T) {
 	require.NoError(t, err)
 	defer decomp.Close()
 
-	err = BuildBtreeIndexWithDecompressor(tmp+".bt", decomp)
+	err = BuildBtreeIndexWithDecompressor(tmp+".bt", decomp, &background.Progress{})
 	require.NoError(t, err)
 
 	bt, err := OpenBtreeIndexWithDecompressor(tmp+".bt", M, decomp)
 	require.NoError(t, err)
 	require.EqualValues(t, bt.KeyCount(), keyCount)
 	bt.Close()
-}
-
-func Test_BtreeIndex_Allocation(t *testing.T) {
-	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
-	m := 2
-	for i := 5; i < 24; i++ {
-		t.Run(fmt.Sprintf("%d", m<<i), func(t *testing.T) {
-			for j := 0; j < 10; j++ {
-				var count int
-				for {
-					count = rnd.Intn(100000000)
-					if count > (m<<1)*4 {
-						break
-					}
-				}
-
-				bt := newBtAlloc(uint64(count), uint64(m)<<i, false)
-				bt.traverseDfs()
-				require.GreaterOrEqual(t, bt.N, uint64(count))
-
-				require.LessOrEqual(t, float64(bt.N-uint64(count))/float64(bt.N), 0.05)
-			}
-		})
-	}
-}
-
-func Test_btree_Seek(t *testing.T) {
-	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
-	tmp := t.TempDir()
-
-	dataPath := generateCompressedKV(t, tmp, 52, 10, 1000000)
-	defer os.RemoveAll(tmp)
-	//dir, _ := os.Getwd()
-	//fmt.Printf("path %s\n", dir)
-	//dataPath := "../../data/storage.256-288.kv"
-
-	indexPath := path.Join(tmp, filepath.Base(dataPath)+".bti")
-	err := BuildBtreeIndex(dataPath, indexPath)
-	require.NoError(t, err)
-
-	M := 1024
-	bt, err := OpenBtreeIndex(indexPath, dataPath, uint64(M))
-
-	require.NoError(t, err)
-
-	keys, err := pivotKeysFromKV(dataPath)
-	require.NoError(t, err)
-
-	tsum := time.Duration(0)
-
-	var i int
-	for i = 1; i < 10000; i++ {
-		p := rnd.Intn(len(keys))
-		cl := time.Now()
-		cur, err := bt.Seek(keys[p])
-		took := time.Since(cl)
-		tsum += took
-
-		require.NoErrorf(t, err, "i=%d", i)
-		require.EqualValues(t, keys[p], cur.key)
-
-		prevKey := common.Copy(keys[p])
-		var j int
-		ntimer := time.Duration(0)
-		for j = 0; j < 10000; j++ {
-			ntime := time.Now()
-
-			if !cur.Next() {
-				break
-			}
-			ntimer += time.Since(ntime)
-
-			nk := cur.Key()
-			if bytes.Compare(prevKey, nk) > 0 {
-				t.Fatalf("prev %s cur %s, next key should be greater", prevKey, nk)
-			}
-			prevKey = nk
-		}
-		if i%1000 == 0 {
-			fmt.Printf("%d searches, last took %v avg=%v next_access_last[of %d keys] %v\n", i, took, tsum/time.Duration(i), j, ntimer/time.Duration(j))
-		}
-
-	}
-	avg := tsum / (1000000 - 1)
-	fmt.Printf("avg seek time %v\n", avg)
-
-	bt.Close()
-}
-
-func Test_Recsplit_Find(t *testing.T) {
-	t.Skip()
-
-	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
-	tmp := t.TempDir()
-
-	defer os.RemoveAll(tmp)
-	dir, _ := os.Getwd()
-	fmt.Printf("path %s\n", dir)
-	dataPath := "../../data/storage.256-288.kv"
-	indexPath := dataPath + "i"
-
-	idx, err := recsplit.OpenIndex(indexPath)
-	require.NoError(t, err)
-	idxr := recsplit.NewIndexReader(idx)
-
-	decomp, err := compress.NewDecompressor(dataPath)
-	require.NoError(t, err)
-	defer decomp.Close()
-
-	getter := decomp.MakeGetter()
-
-	keys, err := pivotKeysFromKV(dataPath)
-	require.NoError(t, err)
-
-	tsum := time.Duration(0)
-
-	var i int
-	for i = 1; i < 10000000; i++ {
-		p := rnd.Intn(len(keys))
-		cl := time.Now()
-		offset := idxr.Lookup(keys[p])
-		getter.Reset(offset)
-
-		require.True(t, getter.HasNext())
-
-		key, pa := getter.Next(nil)
-		require.NotEmpty(t, key)
-
-		value, pb := getter.Next(nil)
-		if pb-pa != 1 {
-			require.NotEmpty(t, value)
-		}
-
-		took := time.Since(cl)
-		tsum += took
-
-		require.NoErrorf(t, err, "i=%d", i)
-		require.EqualValues(t, keys[p], key)
-
-		if i%1000 == 0 {
-			fmt.Printf("%d searches, last took %v avg=%v\n", i, took, tsum/time.Duration(i))
-		}
-
-	}
-	avg := tsum / (1000000 - 1)
-	fmt.Printf("avg seek time %v\n", avg)
 }
