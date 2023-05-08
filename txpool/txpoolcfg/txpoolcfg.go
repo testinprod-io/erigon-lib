@@ -19,6 +19,8 @@ type Config struct {
 	AccountSlots          uint64 // Number of executable transaction slots guaranteed per account
 	PriceBump             uint64 // Price bump percentage to replace an already existing transaction
 	OverrideShanghaiTime  *big.Int
+
+	Optimism bool
 }
 
 var DefaultConfig = Config{
@@ -35,4 +37,6 @@ var DefaultConfig = Config{
 	AccountSlots:         16, //TODO: to choose right value (16 to be compatible with Geth)
 	PriceBump:            10, // Price bump percentage to replace an already existing transaction
 	OverrideShanghaiTime: nil,
+
+	Optimism: false,
 }
