@@ -27,10 +27,13 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/VictoriaMetrics/metrics"
 	"github.com/holiman/uint256"
-	"github.com/ledgerwatch/log/v3"
-
+	"github.com/ledgerwatch/erigon-lib/common/background"
+	"github.com/ledgerwatch/erigon-lib/kv/iter"
 	"github.com/ledgerwatch/erigon-lib/kv/order"
+	"github.com/ledgerwatch/log/v3"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/ledgerwatch/erigon-lib/commitment"
 	"github.com/ledgerwatch/erigon-lib/common/length"
@@ -41,7 +44,31 @@ import (
 // files of smaller size are also immutable, but can be removed after merge to bigger files.
 const StepsInBiggestFile = 32
 
+var (
+	mxCurrentTx                = metrics.GetOrCreateCounter("domain_tx_processed")
+	mxCurrentBlock             = metrics.GetOrCreateCounter("domain_block_current")
+	mxRunningMerges            = metrics.GetOrCreateCounter("domain_running_merges")
+	mxRunningCollations        = metrics.GetOrCreateCounter("domain_running_collations")
+	mxCollateTook              = metrics.GetOrCreateHistogram("domain_collate_took")
+	mxPruneTook                = metrics.GetOrCreateHistogram("domain_prune_took")
+	mxPruneHistTook            = metrics.GetOrCreateHistogram("domain_prune_hist_took")
+	mxPruningProgress          = metrics.GetOrCreateCounter("domain_pruning_progress")
+	mxCollationSize            = metrics.GetOrCreateCounter("domain_collation_size")
+	mxCollationSizeHist        = metrics.GetOrCreateCounter("domain_collation_hist_size")
+	mxPruneSize                = metrics.GetOrCreateCounter("domain_prune_size")
+	mxBuildTook                = metrics.GetOrCreateSummary("domain_build_files_took")
+	mxStepCurrent              = metrics.GetOrCreateCounter("domain_step_current")
+	mxStepTook                 = metrics.GetOrCreateHistogram("domain_step_took")
+	mxCommitmentKeys           = metrics.GetOrCreateCounter("domain_commitment_keys")
+	mxCommitmentRunning        = metrics.GetOrCreateCounter("domain_running_commitment")
+	mxCommitmentTook           = metrics.GetOrCreateSummary("domain_commitment_took")
+	mxCommitmentWriteTook      = metrics.GetOrCreateHistogram("domain_commitment_write_took")
+	mxCommitmentUpdates        = metrics.GetOrCreateCounter("domain_commitment_updates")
+	mxCommitmentUpdatesApplied = metrics.GetOrCreateCounter("domain_commitment_updates_applied")
+)
+
 type Aggregator struct {
+	db              kv.RwDB
 	aggregationStep uint64
 	accounts        *Domain
 	storage         *Domain
@@ -59,10 +86,28 @@ type Aggregator struct {
 	stats           FilesStats
 	tmpdir          string
 	defaultCtx      *AggregatorContext
+
+	ps *background.ProgressSet
 }
 
+//type exposedMetrics struct {
+//	CollationSize     *metrics.Gauge
+//	CollationSizeHist *metrics.Gauge
+//	PruneSize         *metrics.Gauge
+//
+//	lastCollSize    int
+//	lastColHistSize int
+//	lastPruneSize   int
+//}
+//
+//func (e exposedMetrics) init() {
+//	e.CollationSize = metrics.GetOrCreateGauge("domain_collation_size", func() float64 { return 0 })
+//	e.CollationSizeHist = metrics.GetOrCreateGauge("domain_collation_hist_size", func() float64 { return 0 })
+//	e.PruneSize = metrics.GetOrCreateGauge("domain_prune_size", func() float64 { return e.lastPruneSize })
+//}
+
 func NewAggregator(dir, tmpdir string, aggregationStep uint64, commitmentMode CommitmentMode, commitTrieVariant commitment.TrieVariant) (*Aggregator, error) {
-	a := &Aggregator{aggregationStep: aggregationStep, tmpdir: tmpdir, stepDoneNotice: make(chan [length.Hash]byte, 1)}
+	a := &Aggregator{aggregationStep: aggregationStep, ps: background.NewProgressSet(), tmpdir: tmpdir, stepDoneNotice: make(chan [length.Hash]byte, 1)}
 
 	closeAgg := true
 	defer func() {
@@ -74,17 +119,17 @@ func NewAggregator(dir, tmpdir string, aggregationStep uint64, commitmentMode Co
 	if err != nil {
 		return nil, err
 	}
-	if a.accounts, err = NewDomain(dir, tmpdir, aggregationStep, "accounts", kv.AccountKeys, kv.AccountVals, kv.AccountHistoryKeys, kv.AccountHistoryVals, kv.AccountSettings, kv.AccountIdx, false /* compressVals */); err != nil {
+	if a.accounts, err = NewDomain(dir, tmpdir, aggregationStep, "accounts", kv.AccountKeys, kv.AccountVals, kv.AccountHistoryKeys, kv.AccountHistoryVals, kv.AccountIdx, false, false); err != nil {
 		return nil, err
 	}
-	if a.storage, err = NewDomain(dir, tmpdir, aggregationStep, "storage", kv.StorageKeys, kv.StorageVals, kv.StorageHistoryKeys, kv.StorageHistoryVals, kv.StorageSettings, kv.StorageIdx, false /* compressVals */); err != nil {
+	if a.storage, err = NewDomain(dir, tmpdir, aggregationStep, "storage", kv.StorageKeys, kv.StorageVals, kv.StorageHistoryKeys, kv.StorageHistoryVals, kv.StorageIdx, false, false); err != nil {
 		return nil, err
 	}
-	if a.code, err = NewDomain(dir, tmpdir, aggregationStep, "code", kv.CodeKeys, kv.CodeVals, kv.CodeHistoryKeys, kv.CodeHistoryVals, kv.CodeSettings, kv.CodeIdx, true /* compressVals */); err != nil {
+	if a.code, err = NewDomain(dir, tmpdir, aggregationStep, "code", kv.CodeKeys, kv.CodeVals, kv.CodeHistoryKeys, kv.CodeHistoryVals, kv.CodeIdx, true, true); err != nil {
 		return nil, err
 	}
 
-	commitd, err := NewDomain(dir, tmpdir, aggregationStep, "commitment", kv.CommitmentKeys, kv.CommitmentVals, kv.CommitmentHistoryKeys, kv.CommitmentHistoryVals, kv.CommitmentSettings, kv.CommitmentIdx, false /* compressVals */)
+	commitd, err := NewDomain(dir, tmpdir, aggregationStep, "commitment", kv.CommitmentKeys, kv.CommitmentVals, kv.CommitmentHistoryKeys, kv.CommitmentHistoryVals, kv.CommitmentIdx, false, true)
 	if err != nil {
 		return nil, err
 	}
@@ -104,12 +149,36 @@ func NewAggregator(dir, tmpdir string, aggregationStep uint64, commitmentMode Co
 	}
 	closeAgg = false
 
-	//a.defaultCtx = a.MakeContext()
+	a.seekTxNum = a.EndTxNumMinimax()
 	return a, nil
 }
 
-func (a *Aggregator) ReopenFolder() error {
-	var err error
+func (a *Aggregator) SetDB(db kv.RwDB) { a.db = db }
+
+func (a *Aggregator) buildMissedIdxBlocking(d *Domain) error {
+	eg, ctx := errgroup.WithContext(context.Background())
+	eg.SetLimit(32)
+	if err := d.BuildMissedIndices(ctx, eg, a.ps); err != nil {
+		return err
+	}
+	return eg.Wait()
+}
+func (a *Aggregator) ReopenFolder() (err error) {
+	{
+		if err = a.buildMissedIdxBlocking(a.accounts); err != nil {
+			return err
+		}
+		if err = a.buildMissedIdxBlocking(a.storage); err != nil {
+			return err
+		}
+		if err = a.buildMissedIdxBlocking(a.code); err != nil {
+			return err
+		}
+		if err = a.buildMissedIdxBlocking(a.commitment.Domain); err != nil {
+			return err
+		}
+	}
+
 	if err = a.accounts.OpenFolder(); err != nil {
 		return fmt.Errorf("OpenFolder: %w", err)
 	}
@@ -167,7 +236,7 @@ func (a *Aggregator) ReopenList(fNames []string) error {
 }
 
 func (a *Aggregator) GetAndResetStats() DomainStats {
-	stats := DomainStats{}
+	stats := DomainStats{HistoryQueries: &atomic.Uint64{}, TotalQueries: &atomic.Uint64{}}
 	stats.Accumulate(a.accounts.GetAndResetStats())
 	stats.Accumulate(a.storage.GetAndResetStats())
 	stats.Accumulate(a.code.GetAndResetStats())
@@ -233,6 +302,8 @@ func (a *Aggregator) SetTx(tx kv.RwTx) {
 }
 
 func (a *Aggregator) SetTxNum(txNum uint64) {
+	mxCurrentTx.Set(txNum)
+
 	a.txNum = txNum
 	a.accounts.SetTxNum(txNum)
 	a.storage.SetTxNum(txNum)
@@ -242,6 +313,11 @@ func (a *Aggregator) SetTxNum(txNum uint64) {
 	a.logTopics.SetTxNum(txNum)
 	a.tracesFrom.SetTxNum(txNum)
 	a.tracesTo.SetTxNum(txNum)
+}
+
+func (a *Aggregator) SetBlockNum(blockNum uint64) {
+	a.blockNum = blockNum
+	mxCurrentBlock.Set(blockNum)
 }
 
 func (a *Aggregator) SetWorkers(i int) {
@@ -285,17 +361,61 @@ func (a *Aggregator) EndTxNumMinimax() uint64 {
 	return min
 }
 
-func (a *Aggregator) SeekCommitment() (txNum uint64, err error) {
+func (a *Aggregator) DomainEndTxNumMinimax() uint64 {
+	min := a.accounts.endTxNumMinimax()
+	if txNum := a.storage.endTxNumMinimax(); txNum < min {
+		min = txNum
+	}
+	if txNum := a.code.endTxNumMinimax(); txNum < min {
+		min = txNum
+	}
+	if txNum := a.commitment.endTxNumMinimax(); txNum < min {
+		min = txNum
+	}
+	return min
+}
+
+func (a *Aggregator) SeekCommitment() (blockNum, txNum uint64, err error) {
 	filesTxNum := a.EndTxNumMinimax()
-	txNum, err = a.commitment.SeekCommitment(a.aggregationStep, filesTxNum)
+	blockNum, txNum, err = a.commitment.SeekCommitment(a.aggregationStep, filesTxNum)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	if txNum == 0 {
 		return
 	}
 	a.seekTxNum = txNum + 1
-	return txNum + 1, nil
+	return blockNum, txNum + 1, nil
+}
+
+func (a *Aggregator) mergeDomainSteps(ctx context.Context) error {
+	mergeStartedAt := time.Now()
+	maxEndTxNum := a.DomainEndTxNumMinimax()
+
+	var upmerges int
+	for {
+		a.defaultCtx.Close()
+		a.defaultCtx = a.MakeContext()
+
+		somethingMerged, err := a.mergeLoopStep(ctx, maxEndTxNum, 1)
+		if err != nil {
+			return err
+		}
+
+		if !somethingMerged {
+			break
+		}
+		upmerges++
+	}
+
+	if upmerges > 1 {
+		log.Info("[stat] aggregation merged",
+			"upto_tx", maxEndTxNum,
+			"merge_took", time.Since(mergeStartedAt),
+			"merges_count", upmerges)
+	}
+
+	return nil
 }
 
 func (a *Aggregator) aggregate(ctx context.Context, step uint64) error {
@@ -313,10 +433,18 @@ func (a *Aggregator) aggregate(ctx context.Context, step uint64) error {
 
 	defer logEvery.Stop()
 
-	for i, d := range []*Domain{a.accounts, a.storage, a.code, a.commitment.Domain} {
+	for _, d := range []*Domain{a.accounts, a.storage, a.code, a.commitment.Domain} {
 		wg.Add(1)
 
-		collation, err := d.collateStream(ctx, step, txFrom, txTo, d.tx, logEvery)
+		mxRunningCollations.Inc()
+		start := time.Now()
+		collation, err := d.collateStream(ctx, step, txFrom, txTo, d.tx)
+		mxRunningCollations.Dec()
+		mxCollateTook.UpdateDuration(start)
+
+		//mxCollationSize.Set(uint64(collation.valuesComp.Count()))
+		mxCollationSizeHist.Set(uint64(collation.historyComp.Count()))
+
 		if err != nil {
 			collation.Close()
 			return fmt.Errorf("domain collation %q has failed: %w", d.filenameBase, err)
@@ -324,35 +452,57 @@ func (a *Aggregator) aggregate(ctx context.Context, step uint64) error {
 
 		go func(wg *sync.WaitGroup, d *Domain, collation Collation) {
 			defer wg.Done()
+			mxRunningMerges.Inc()
 
 			start := time.Now()
-			sf, err := d.buildFiles(ctx, step, collation)
+			sf, err := d.buildFiles(ctx, step, collation, a.ps)
 			collation.Close()
+
 			if err != nil {
 				errCh <- err
+
 				sf.Close()
+				mxRunningMerges.Dec()
 				return
 			}
+
+			mxRunningMerges.Dec()
 
 			d.integrateFiles(sf, step*a.aggregationStep, (step+1)*a.aggregationStep)
 			d.stats.LastFileBuildingTook = time.Since(start)
 		}(&wg, d, collation)
 
-		if i != 3 { // do not warmup commitment domain
-			if err := d.warmup(ctx, txFrom, d.aggregationStep/10, d.tx); err != nil {
-				return fmt.Errorf("warmup %q domain failed: %w", d.filenameBase, err)
-			}
-		}
+		mxPruningProgress.Add(2) // domain and history
 		if err := d.prune(ctx, step, txFrom, txTo, math.MaxUint64, logEvery); err != nil {
 			return err
 		}
+		mxPruningProgress.Dec()
+		mxPruningProgress.Dec()
+
+		mxPruneTook.Update(d.stats.LastPruneTook.Seconds())
+		mxPruneHistTook.Update(d.stats.LastPruneHistTook.Seconds())
 	}
+
+	// when domain files are build and db is pruned, we can merge them
+	wg.Add(1)
+	go func(wg *sync.WaitGroup) {
+		defer wg.Done()
+
+		if err := a.mergeDomainSteps(ctx); err != nil {
+			errCh <- err
+		}
+	}(&wg)
 
 	// indices are built concurrently
 	for _, d := range []*InvertedIndex{a.logTopics, a.logAddrs, a.tracesFrom, a.tracesTo} {
 		wg.Add(1)
 
-		collation, err := d.collate(ctx, step*a.aggregationStep, (step+1)*a.aggregationStep, d.tx, logEvery)
+		mxRunningCollations.Inc()
+		start := time.Now()
+		collation, err := d.collate(ctx, step*a.aggregationStep, (step+1)*a.aggregationStep, d.tx)
+		mxRunningCollations.Dec()
+		mxCollateTook.UpdateDuration(start)
+
 		if err != nil {
 			return fmt.Errorf("index collation %q has failed: %w", d.filenameBase, err)
 		}
@@ -360,27 +510,43 @@ func (a *Aggregator) aggregate(ctx context.Context, step uint64) error {
 		go func(wg *sync.WaitGroup, d *InvertedIndex, tx kv.Tx) {
 			defer wg.Done()
 
-			sf, err := d.buildFiles(ctx, step, collation)
+			mxRunningMerges.Inc()
+			start := time.Now()
+
+			sf, err := d.buildFiles(ctx, step, collation, a.ps)
 			if err != nil {
 				errCh <- err
 				sf.Close()
 				return
 			}
+
+			mxRunningMerges.Dec()
+			mxBuildTook.UpdateDuration(start)
+
 			d.integrateFiles(sf, step*a.aggregationStep, (step+1)*a.aggregationStep)
 
 			icx := d.MakeContext()
-			defer icx.Close()
+			mxRunningMerges.Inc()
 
-			mm := d.endTxNumMinimax()
-			if err := d.mergeRangesUpTo(ctx, mm, maxSpan, workers, icx); err != nil {
+			if err := d.mergeRangesUpTo(ctx, d.endTxNumMinimax(), maxSpan, workers, icx, a.ps); err != nil {
 				errCh <- err
+
+				mxRunningMerges.Dec()
+				icx.Close()
 				return
 			}
+
+			mxRunningMerges.Dec()
+			icx.Close()
 		}(&wg, d, d.tx)
 
+		mxPruningProgress.Inc()
+		startPrune := time.Now()
 		if err := d.prune(ctx, txFrom, txTo, math.MaxUint64, logEvery); err != nil {
 			return err
 		}
+		mxPruneTook.UpdateDuration(startPrune)
+		mxPruningProgress.Dec()
 	}
 
 	go func() {
@@ -393,64 +559,12 @@ func (a *Aggregator) aggregate(ctx context.Context, step uint64) error {
 		return fmt.Errorf("domain collate-build failed: %w", err)
 	}
 
-	var clo, chi, plo, phi, blo, bhi time.Duration
-	clo, plo, blo = time.Hour*99, time.Hour*99, time.Hour*99
-	for _, s := range []DomainStats{a.accounts.stats, a.code.stats, a.storage.stats} {
-		c := s.LastCollationTook
-		p := s.LastPruneTook
-		b := s.LastFileBuildingTook
-
-		if c < clo {
-			clo = c
-		}
-		if c > chi {
-			chi = c
-		}
-		if p < plo {
-			plo = p
-		}
-		if p > phi {
-			phi = p
-		}
-		if b < blo {
-			blo = b
-		}
-		if b > bhi {
-			bhi = b
-		}
-	}
-
-	stepTook := time.Since(stepStartedAt)
-	log.Info("[stat] finished aggregation, ready for mergeUpTo",
+	log.Info("[stat] aggregation is finished",
 		"range", fmt.Sprintf("%.2fM-%.2fM", float64(txFrom)/10e5, float64(txTo)/10e5),
-		"step_took", stepTook,
-		"collate_min", clo, "collate_max", chi,
-		"prune_min", plo, "prune_max", phi,
-		"files_build_min", blo, "files_build_max", bhi)
+		"took", time.Since(stepStartedAt))
 
-	mergeStartedAt := time.Now()
-	maxEndTxNum := a.EndTxNumMinimax()
+	mxStepTook.UpdateDuration(stepStartedAt)
 
-	var upmerges int
-	for {
-		a.defaultCtx.Close()
-		a.defaultCtx = a.MakeContext()
-		somethingMerged, err := a.mergeLoopStep(ctx, maxEndTxNum, 1)
-		if err != nil {
-			return err
-		}
-		if !somethingMerged {
-			break
-		}
-		upmerges++
-	}
-
-	log.Info("[stat] aggregation merged",
-		"upto_tx", maxEndTxNum,
-		"aggregation_took", time.Since(stepStartedAt),
-		"step_took", stepTook,
-		"merge_took", time.Since(mergeStartedAt),
-		"merges_count", upmerges)
 	return nil
 }
 
@@ -481,24 +595,15 @@ func (a *Aggregator) mergeLoopStep(ctx context.Context, maxEndTxNum uint64, work
 		}
 	}()
 	a.integrateMergedFiles(outs, in)
-	a.cleanAfterFreeze(in)
+	a.cleanAfterNewFreeze(in)
 	closeAll = false
 
-	var blo, bhi time.Duration
-	blo = time.Hour * 99
 	for _, s := range []DomainStats{a.accounts.stats, a.code.stats, a.storage.stats} {
-		b := s.LastFileBuildingTook
-		if b < blo {
-			blo = b
-		}
-		if b > bhi {
-			bhi = b
-		}
+		mxBuildTook.Update(s.LastFileBuildingTook.Seconds())
 	}
 
 	log.Info("[stat] finished merge step",
-		"upto_tx", maxEndTxNum, "merge_step_took", time.Since(mergeStartedAt),
-		"merge_min", blo, "merge_max", bhi)
+		"upto_tx", maxEndTxNum, "merge_step_took", time.Since(mergeStartedAt))
 
 	return true, nil
 }
@@ -524,7 +629,9 @@ func (a *Aggregator) findMergeRange(maxEndTxNum, maxSpan uint64) Ranges {
 	r.storage = a.storage.findMergeRange(maxEndTxNum, maxSpan)
 	r.code = a.code.findMergeRange(maxEndTxNum, maxSpan)
 	r.commitment = a.commitment.findMergeRange(maxEndTxNum, maxSpan)
-	log.Info(fmt.Sprintf("findMergeRange(%d, %d)=%+v\n", maxEndTxNum, maxSpan, r))
+	//if r.any() {
+	//log.Info(fmt.Sprintf("findMergeRange(%d, %d)=%+v\n", maxEndTxNum, maxSpan, r))
+	//}
 	return r
 }
 
@@ -573,16 +680,16 @@ func (sf SelectedStaticFiles) Close() {
 func (a *Aggregator) staticFilesInRange(r Ranges, ac *AggregatorContext) SelectedStaticFiles {
 	var sf SelectedStaticFiles
 	if r.accounts.any() {
-		sf.accounts, sf.accountsIdx, sf.accountsHist, sf.accountsI = a.accounts.staticFilesInRange(r.accounts, ac.accounts)
+		sf.accounts, sf.accountsIdx, sf.accountsHist, sf.accountsI = ac.accounts.staticFilesInRange(r.accounts)
 	}
 	if r.storage.any() {
-		sf.storage, sf.storageIdx, sf.storageHist, sf.storageI = a.storage.staticFilesInRange(r.storage, ac.storage)
+		sf.storage, sf.storageIdx, sf.storageHist, sf.storageI = ac.storage.staticFilesInRange(r.storage)
 	}
 	if r.code.any() {
-		sf.code, sf.codeIdx, sf.codeHist, sf.codeI = a.code.staticFilesInRange(r.code, ac.code)
+		sf.code, sf.codeIdx, sf.codeHist, sf.codeI = ac.code.staticFilesInRange(r.code)
 	}
 	if r.commitment.any() {
-		sf.commitment, sf.commitmentIdx, sf.commitmentHist, sf.commitmentI = a.commitment.staticFilesInRange(r.commitment, ac.commitment)
+		sf.commitment, sf.commitmentIdx, sf.commitmentHist, sf.commitmentI = ac.commitment.staticFilesInRange(r.commitment)
 	}
 	return sf
 }
@@ -645,49 +752,60 @@ func (a *Aggregator) mergeFiles(ctx context.Context, files SelectedStaticFiles, 
 	wg.Add(4)
 	predicates.Add(2)
 
-	go func(predicates *sync.WaitGroup) {
-		defer wg.Done()
-		defer predicates.Done()
-		var err error
-		if r.accounts.any() {
-			if mf.accounts, mf.accountsIdx, mf.accountsHist, err = a.accounts.mergeFiles(ctx, files.accounts, files.accountsIdx, files.accountsHist, r.accounts, workers); err != nil {
-				errCh <- err
-			}
-		}
-	}(&predicates)
-	go func(predicates *sync.WaitGroup) {
-		defer wg.Done()
-		defer predicates.Done()
-		var err error
-		if r.storage.any() {
-			if mf.storage, mf.storageIdx, mf.storageHist, err = a.storage.mergeFiles(ctx, files.storage, files.storageIdx, files.storageHist, r.storage, workers); err != nil {
-				errCh <- err
-			}
-		}
-	}(&predicates)
 	go func() {
+		mxRunningMerges.Inc()
+		defer mxRunningMerges.Dec()
 		defer wg.Done()
 
 		var err error
 		if r.code.any() {
-			if mf.code, mf.codeIdx, mf.codeHist, err = a.code.mergeFiles(ctx, files.code, files.codeIdx, files.codeHist, r.code, workers); err != nil {
+			if mf.code, mf.codeIdx, mf.codeHist, err = a.code.mergeFiles(ctx, files.code, files.codeIdx, files.codeHist, r.code, workers, a.ps); err != nil {
 				errCh <- err
 			}
 		}
 	}()
 
-	go func(preidcates *sync.WaitGroup) {
+	go func(predicates *sync.WaitGroup) {
+		mxRunningMerges.Inc()
+		defer mxRunningMerges.Dec()
+
+		defer wg.Done()
+		defer predicates.Done()
+		var err error
+		if r.accounts.any() {
+			if mf.accounts, mf.accountsIdx, mf.accountsHist, err = a.accounts.mergeFiles(ctx, files.accounts, files.accountsIdx, files.accountsHist, r.accounts, workers, a.ps); err != nil {
+				errCh <- err
+			}
+		}
+	}(&predicates)
+	go func(predicates *sync.WaitGroup) {
+		mxRunningMerges.Inc()
+		defer mxRunningMerges.Dec()
+
+		defer wg.Done()
+		defer predicates.Done()
+		var err error
+		if r.storage.any() {
+			if mf.storage, mf.storageIdx, mf.storageHist, err = a.storage.mergeFiles(ctx, files.storage, files.storageIdx, files.storageHist, r.storage, workers, a.ps); err != nil {
+				errCh <- err
+			}
+		}
+	}(&predicates)
+
+	go func(predicates *sync.WaitGroup) {
 		defer wg.Done()
 		predicates.Wait()
+
+		mxRunningMerges.Inc()
+		defer mxRunningMerges.Dec()
 
 		var err error
 		// requires storage|accounts to be merged at this point
 		if r.commitment.any() {
-			if mf.commitment, mf.commitmentIdx, mf.commitmentHist, err = a.commitment.mergeFiles(ctx, files, mf, r.commitment, workers); err != nil {
+			if mf.commitment, mf.commitmentIdx, mf.commitmentHist, err = a.commitment.mergeFiles(ctx, files, mf, r.commitment, workers, a.ps); err != nil {
 				errCh <- err
 			}
 		}
-
 	}(&predicates)
 
 	go func() {
@@ -712,142 +830,32 @@ func (a *Aggregator) integrateMergedFiles(outs SelectedStaticFiles, in MergedFil
 	a.commitment.integrateMergedFiles(outs.commitment, outs.commitmentIdx, outs.commitmentHist, in.commitment, in.commitmentIdx, in.commitmentHist)
 }
 
-func (a *Aggregator) cleanAfterFreeze(in MergedFiles) {
-	a.accounts.cleanAfterFreeze(in.accountsHist)
-	a.storage.cleanAfterFreeze(in.storageHist)
-	a.code.cleanAfterFreeze(in.codeHist)
-	a.commitment.cleanAfterFreeze(in.commitment)
+func (a *Aggregator) cleanAfterNewFreeze(in MergedFiles) {
+	a.accounts.cleanAfterFreeze(in.accountsHist.endTxNum)
+	a.storage.cleanAfterFreeze(in.storageHist.endTxNum)
+	a.code.cleanAfterFreeze(in.codeHist.endTxNum)
+	a.commitment.cleanAfterFreeze(in.commitment.endTxNum)
 }
 
-func (ac *AggregatorContext) ReadAccountData(addr []byte, roTx kv.Tx) ([]byte, error) {
-	return ac.accounts.Get(addr, nil, roTx)
-}
-
-func (ac *AggregatorContext) ReadAccountDataBeforeTxNum(addr []byte, txNum uint64, roTx kv.Tx) ([]byte, error) {
-	return ac.accounts.GetBeforeTxNum(addr, txNum, roTx)
-}
-
-func (ac *AggregatorContext) ReadAccountStorage(addr []byte, loc []byte, roTx kv.Tx) ([]byte, error) {
-	return ac.storage.Get(addr, loc, roTx)
-}
-
-func (ac *AggregatorContext) ReadAccountStorageBeforeTxNum(addr []byte, loc []byte, txNum uint64, roTx kv.Tx) ([]byte, error) {
-	if cap(ac.keyBuf) < len(addr)+len(loc) {
-		ac.keyBuf = make([]byte, len(addr)+len(loc))
-	} else if len(ac.keyBuf) != len(addr)+len(loc) {
-		ac.keyBuf = ac.keyBuf[:len(addr)+len(loc)]
-	}
-	copy(ac.keyBuf, addr)
-	copy(ac.keyBuf[len(addr):], loc)
-	return ac.storage.GetBeforeTxNum(ac.keyBuf, txNum, roTx)
-}
-
-func (ac *AggregatorContext) ReadAccountCode(addr []byte, roTx kv.Tx) ([]byte, error) {
-	return ac.code.Get(addr, nil, roTx)
-}
-
-func (ac *AggregatorContext) ReadCommitment(addr []byte, roTx kv.Tx) ([]byte, error) {
-	return ac.commitment.Get(addr, nil, roTx)
-}
-
-func (ac *AggregatorContext) ReadCommitmentBeforeTxNum(addr []byte, txNum uint64, roTx kv.Tx) ([]byte, error) {
-	return ac.commitment.GetBeforeTxNum(addr, txNum, roTx)
-}
-
-func (ac *AggregatorContext) ReadAccountCodeBeforeTxNum(addr []byte, txNum uint64, roTx kv.Tx) ([]byte, error) {
-	return ac.code.GetBeforeTxNum(addr, txNum, roTx)
-}
-
-func (ac *AggregatorContext) ReadAccountCodeSize(addr []byte, roTx kv.Tx) (int, error) {
-	code, err := ac.code.Get(addr, nil, roTx)
-	if err != nil {
-		return 0, err
-	}
-	return len(code), nil
-}
-
-func (ac *AggregatorContext) ReadAccountCodeSizeBeforeTxNum(addr []byte, txNum uint64, roTx kv.Tx) (int, error) {
-	code, err := ac.code.GetBeforeTxNum(addr, txNum, roTx)
-	if err != nil {
-		return 0, err
-	}
-	return len(code), nil
-}
-
-func bytesToUint64(buf []byte) (x uint64) {
-	for i, b := range buf {
-		x = x<<8 + uint64(b)
-		if i == 7 {
-			return
-		}
-	}
-	return
-}
-
-func (a *AggregatorContext) branchFn(prefix []byte) ([]byte, error) {
-	// Look in the summary table first
-	stateValue, err := a.ReadCommitment(prefix, a.a.rwTx)
-	if err != nil {
-		return nil, fmt.Errorf("failed read branch %x: %w", commitment.CompactedKeyToHex(prefix), err)
-	}
-	if stateValue == nil {
-		return nil, nil
-	}
-	// fmt.Printf("Returning branch data prefix [%x], mergeVal=[%x]\n", commitment.CompactedKeyToHex(prefix), stateValue)
-	return stateValue[2:], nil // Skip touchMap but keep afterMap
-}
-
-func (a *AggregatorContext) accountFn(plainKey []byte, cell *commitment.Cell) error {
-	encAccount, err := a.ReadAccountData(plainKey, a.a.rwTx)
-	if err != nil {
-		return err
-	}
-	cell.Nonce = 0
-	cell.Balance.Clear()
-	copy(cell.CodeHash[:], commitment.EmptyCodeHash)
-	if len(encAccount) > 0 {
-		nonce, balance, chash := DecodeAccountBytes(encAccount)
-		cell.Nonce = nonce
-		cell.Balance.Set(balance)
-		if chash != nil {
-			copy(cell.CodeHash[:], chash)
-		}
-	}
-
-	code, err := a.ReadAccountCode(plainKey, a.a.rwTx)
-	if err != nil {
-		return err
-	}
-	if code != nil {
-		a.a.commitment.keccak.Reset()
-		a.a.commitment.keccak.Write(code)
-		copy(cell.CodeHash[:], a.a.commitment.keccak.Sum(nil))
-	}
-	cell.Delete = len(encAccount) == 0 && len(code) == 0
-	return nil
-}
-
-func (a *AggregatorContext) storageFn(plainKey []byte, cell *commitment.Cell) error {
-	// Look in the summary table first
-	enc, err := a.ReadAccountStorage(plainKey[:length.Addr], plainKey[length.Addr:], a.a.rwTx)
-	if err != nil {
-		return err
-	}
-	cell.StorageLen = len(enc)
-	copy(cell.Storage[:], enc)
-	cell.Delete = cell.StorageLen == 0
-	return nil
-}
-
-// Evaluates commitment for processed state. Commit=true - store trie state after evaluation
+// ComputeCommitment evaluates commitment for processed state.
+// If `saveStateAfter`=true, then trie state will be saved to DB after commitment evaluation.
 func (a *Aggregator) ComputeCommitment(saveStateAfter, trace bool) (rootHash []byte, err error) {
+	// if commitment mode is Disabled, there will be nothing to compute on.
+	mxCommitmentRunning.Inc()
 	rootHash, branchNodeUpdates, err := a.commitment.ComputeCommitment(trace)
+	mxCommitmentRunning.Dec()
+
 	if err != nil {
 		return nil, err
 	}
 	if a.seekTxNum > a.txNum {
 		saveStateAfter = false
 	}
+
+	mxCommitmentKeys.Add(int(a.commitment.comKeys))
+	mxCommitmentTook.Update(a.commitment.comTook.Seconds())
+
+	defer func(t time.Time) { mxCommitmentWriteTook.UpdateDuration(t) }(time.Now())
 
 	for pref, update := range branchNodeUpdates {
 		prefix := []byte(pref)
@@ -856,7 +864,7 @@ func (a *Aggregator) ComputeCommitment(saveStateAfter, trace bool) (rootHash []b
 		if err != nil {
 			return nil, err
 		}
-
+		mxCommitmentUpdates.Inc()
 		stated := commitment.BranchData(stateValue)
 		merged, err := a.commitment.branchMerger.Merge(stated, update)
 		if err != nil {
@@ -871,6 +879,7 @@ func (a *Aggregator) ComputeCommitment(saveStateAfter, trace bool) (rootHash []b
 		if err = a.UpdateCommitmentData(prefix, merged); err != nil {
 			return nil, err
 		}
+		mxCommitmentUpdatesApplied.Inc()
 	}
 
 	if saveStateAfter {
@@ -882,13 +891,21 @@ func (a *Aggregator) ComputeCommitment(saveStateAfter, trace bool) (rootHash []b
 	return rootHash, nil
 }
 
-func (a *Aggregator) ReadyToFinishTx() bool {
-	return (a.txNum+1)%a.aggregationStep == 0 && a.seekTxNum < a.txNum
-}
-
 // Provides channel which receives commitment hash each time aggregation is occured
 func (a *Aggregator) AggregatedRoots() chan [length.Hash]byte {
 	return a.stepDoneNotice
+}
+
+func (a *Aggregator) notifyAggregated(rootHash []byte) {
+	rh := (*[length.Hash]byte)(rootHash)
+	select {
+	case a.stepDoneNotice <- *rh:
+	default:
+	}
+}
+
+func (a *Aggregator) ReadyToFinishTx() bool {
+	return (a.txNum+1)%a.aggregationStep == 0 && a.seekTxNum < a.txNum
 }
 
 func (a *Aggregator) FinishTx() (err error) {
@@ -898,36 +915,34 @@ func (a *Aggregator) FinishTx() (err error) {
 		return nil
 	}
 
+	mxRunningMerges.Inc()
+	defer mxRunningMerges.Dec()
+
 	a.commitment.patriciaTrie.ResetFns(a.defaultCtx.branchFn, a.defaultCtx.accountFn, a.defaultCtx.storageFn)
 	rootHash, err := a.ComputeCommitment(true, false)
 	if err != nil {
 		return err
 	}
 	step := a.txNum / a.aggregationStep
+	mxStepCurrent.Set(step)
+
 	if step == 0 {
 		a.notifyAggregated(rootHash)
 		return nil
 	}
 	step-- // Leave one step worth in the DB
-	if err := a.Flush(context.TODO()); err != nil {
+
+	ctx := context.Background()
+	if err := a.Flush(ctx); err != nil {
 		return err
 	}
 
-	ctx := context.Background()
 	if err := a.aggregate(ctx, step); err != nil {
 		return err
 	}
 
 	a.notifyAggregated(rootHash)
 	return nil
-}
-
-func (a *Aggregator) notifyAggregated(rootHash []byte) {
-	rh := (*[length.Hash]byte)(rootHash[:])
-	select {
-	case a.stepDoneNotice <- *rh:
-	default:
-	}
 }
 
 func (a *Aggregator) UpdateAccountData(addr []byte, account []byte) error {
@@ -994,22 +1009,6 @@ func (a *Aggregator) AddLogAddr(addr []byte) error {
 
 func (a *Aggregator) AddLogTopic(topic []byte) error {
 	return a.logTopics.Add(topic)
-}
-
-func (ac *AggregatorContext) LogAddrIterator(addr []byte, startTxNum, endTxNum int, roTx kv.Tx) (*InvertedIterator, error) {
-	return ac.logAddrs.IterateRange(addr, startTxNum, endTxNum, order.Asc, -1, roTx)
-}
-
-func (ac *AggregatorContext) LogTopicIterator(topic []byte, startTxNum, endTxNum int, roTx kv.Tx) (*InvertedIterator, error) {
-	return ac.logTopics.IterateRange(topic, startTxNum, endTxNum, order.Asc, -1, roTx)
-}
-
-func (ac *AggregatorContext) TraceFromIterator(addr []byte, startTxNum, endTxNum int, roTx kv.Tx) (*InvertedIterator, error) {
-	return ac.tracesFrom.IterateRange(addr, startTxNum, endTxNum, order.Asc, -1, roTx)
-}
-
-func (ac *AggregatorContext) TraceToIterator(addr []byte, startTxNum, endTxNum int, roTx kv.Tx) (*InvertedIterator, error) {
-	return ac.tracesTo.IterateRange(addr, startTxNum, endTxNum, order.Asc, -1, roTx)
 }
 
 // StartWrites - pattern: `defer agg.StartWrites().FinishWrites()`
@@ -1089,8 +1088,8 @@ func (a *Aggregator) Stats() FilesStats {
 	res.IdxSize = stat.IndexSize
 	res.DataSize = stat.DataSize
 	res.FilesCount = stat.FilesCount
-	res.HistoryReads = stat.HistoryQueries
-	res.TotalReads = stat.TotalQueries
+	res.HistoryReads = stat.HistoryQueries.Load()
+	res.TotalReads = stat.TotalQueries.Load()
 	res.IdxAccess = stat.EfSearchTime
 	return res
 }
@@ -1120,6 +1119,136 @@ func (a *Aggregator) MakeContext() *AggregatorContext {
 		tracesFrom: a.tracesFrom.MakeContext(),
 		tracesTo:   a.tracesTo.MakeContext(),
 	}
+}
+
+func (ac *AggregatorContext) ReadAccountData(addr []byte, roTx kv.Tx) ([]byte, error) {
+	return ac.accounts.Get(addr, nil, roTx)
+}
+
+func (ac *AggregatorContext) ReadAccountDataBeforeTxNum(addr []byte, txNum uint64, roTx kv.Tx) ([]byte, error) {
+	v, err := ac.accounts.GetBeforeTxNum(addr, txNum, roTx)
+	return v, err
+}
+
+func (ac *AggregatorContext) ReadAccountStorage(addr []byte, loc []byte, roTx kv.Tx) ([]byte, error) {
+	return ac.storage.Get(addr, loc, roTx)
+}
+
+func (ac *AggregatorContext) ReadAccountStorageBeforeTxNum(addr []byte, loc []byte, txNum uint64, roTx kv.Tx) ([]byte, error) {
+	if cap(ac.keyBuf) < len(addr)+len(loc) {
+		ac.keyBuf = make([]byte, len(addr)+len(loc))
+	} else if len(ac.keyBuf) != len(addr)+len(loc) {
+		ac.keyBuf = ac.keyBuf[:len(addr)+len(loc)]
+	}
+	copy(ac.keyBuf, addr)
+	copy(ac.keyBuf[len(addr):], loc)
+	v, err := ac.storage.GetBeforeTxNum(ac.keyBuf, txNum, roTx)
+	return v, err
+}
+
+func (ac *AggregatorContext) ReadAccountCode(addr []byte, roTx kv.Tx) ([]byte, error) {
+	return ac.code.Get(addr, nil, roTx)
+}
+
+func (ac *AggregatorContext) ReadCommitment(addr []byte, roTx kv.Tx) ([]byte, error) {
+	return ac.commitment.Get(addr, nil, roTx)
+}
+
+func (ac *AggregatorContext) ReadCommitmentBeforeTxNum(addr []byte, txNum uint64, roTx kv.Tx) ([]byte, error) {
+	v, err := ac.commitment.GetBeforeTxNum(addr, txNum, roTx)
+	return v, err
+}
+
+func (ac *AggregatorContext) ReadAccountCodeBeforeTxNum(addr []byte, txNum uint64, roTx kv.Tx) ([]byte, error) {
+	v, err := ac.code.GetBeforeTxNum(addr, txNum, roTx)
+	return v, err
+}
+
+func (ac *AggregatorContext) ReadAccountCodeSize(addr []byte, roTx kv.Tx) (int, error) {
+	code, err := ac.code.Get(addr, nil, roTx)
+	if err != nil {
+		return 0, err
+	}
+	return len(code), nil
+}
+
+func (ac *AggregatorContext) ReadAccountCodeSizeBeforeTxNum(addr []byte, txNum uint64, roTx kv.Tx) (int, error) {
+	code, err := ac.code.GetBeforeTxNum(addr, txNum, roTx)
+	if err != nil {
+		return 0, err
+	}
+	return len(code), nil
+}
+
+func (ac *AggregatorContext) branchFn(prefix []byte) ([]byte, error) {
+	// Look in the summary table first
+	stateValue, err := ac.ReadCommitment(prefix, ac.a.rwTx)
+	if err != nil {
+		return nil, fmt.Errorf("failed read branch %x: %w", commitment.CompactedKeyToHex(prefix), err)
+	}
+	if stateValue == nil {
+		return nil, nil
+	}
+	// fmt.Printf("Returning branch data prefix [%x], mergeVal=[%x]\n", commitment.CompactedKeyToHex(prefix), stateValue)
+	return stateValue[2:], nil // Skip touchMap but keep afterMap
+}
+
+func (ac *AggregatorContext) accountFn(plainKey []byte, cell *commitment.Cell) error {
+	encAccount, err := ac.ReadAccountData(plainKey, ac.a.rwTx)
+	if err != nil {
+		return err
+	}
+	cell.Nonce = 0
+	cell.Balance.Clear()
+	copy(cell.CodeHash[:], commitment.EmptyCodeHash)
+	if len(encAccount) > 0 {
+		nonce, balance, chash := DecodeAccountBytes(encAccount)
+		cell.Nonce = nonce
+		cell.Balance.Set(balance)
+		if chash != nil {
+			copy(cell.CodeHash[:], chash)
+		}
+	}
+
+	code, err := ac.ReadAccountCode(plainKey, ac.a.rwTx)
+	if err != nil {
+		return err
+	}
+	if code != nil {
+		ac.a.commitment.keccak.Reset()
+		ac.a.commitment.keccak.Write(code)
+		copy(cell.CodeHash[:], ac.a.commitment.keccak.Sum(nil))
+	}
+	cell.Delete = len(encAccount) == 0 && len(code) == 0
+	return nil
+}
+
+func (ac *AggregatorContext) storageFn(plainKey []byte, cell *commitment.Cell) error {
+	// Look in the summary table first
+	enc, err := ac.ReadAccountStorage(plainKey[:length.Addr], plainKey[length.Addr:], ac.a.rwTx)
+	if err != nil {
+		return err
+	}
+	cell.StorageLen = len(enc)
+	copy(cell.Storage[:], enc)
+	cell.Delete = cell.StorageLen == 0
+	return nil
+}
+
+func (ac *AggregatorContext) LogAddrIterator(addr []byte, startTxNum, endTxNum int, roTx kv.Tx) (iter.U64, error) {
+	return ac.logAddrs.IdxRange(addr, startTxNum, endTxNum, order.Asc, -1, roTx)
+}
+
+func (ac *AggregatorContext) LogTopicIterator(topic []byte, startTxNum, endTxNum int, roTx kv.Tx) (iter.U64, error) {
+	return ac.logTopics.IdxRange(topic, startTxNum, endTxNum, order.Asc, -1, roTx)
+}
+
+func (ac *AggregatorContext) TraceFromIterator(addr []byte, startTxNum, endTxNum int, roTx kv.Tx) (iter.U64, error) {
+	return ac.tracesFrom.IdxRange(addr, startTxNum, endTxNum, order.Asc, -1, roTx)
+}
+
+func (ac *AggregatorContext) TraceToIterator(addr []byte, startTxNum, endTxNum int, roTx kv.Tx) (iter.U64, error) {
+	return ac.tracesTo.IdxRange(addr, startTxNum, endTxNum, order.Asc, -1, roTx)
 }
 
 func (ac *AggregatorContext) Close() {
@@ -1209,7 +1338,7 @@ func EncodeAccountBytes(nonce uint64, balance *uint256.Int, hash []byte, incarna
 	} else {
 		value[pos] = 32
 		pos++
-		copy(value[pos:pos+32], hash[:])
+		copy(value[pos:pos+32], hash)
 		pos += 32
 	}
 	if incarnation == 0 {
@@ -1224,4 +1353,14 @@ func EncodeAccountBytes(nonce uint64, balance *uint256.Int, hash []byte, incarna
 		}
 	}
 	return value
+}
+
+func bytesToUint64(buf []byte) (x uint64) {
+	for i, b := range buf {
+		x = x<<8 + uint64(b)
+		if i == 7 {
+			return
+		}
+	}
+	return
 }
