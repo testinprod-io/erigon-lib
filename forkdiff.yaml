@@ -4,7 +4,7 @@ footer: |  # define the footer with markdown
 base:
   name: ledgerwatch/erigon-lib
   url: https://github.com/ledgerwatch/erigon-lib
-  hash: 1a14cfd7e7641ddcd82bb9401aa54a21a725c94d
+  hash: b1183da945a26dfc89d890b57e0dc9b52c28fcff
 fork:
   name: testinprod-io/erigon-lib
   url: https://github.com/testinprod-io/erigon-lib
