@@ -1288,7 +1288,14 @@ func (c *MdbxCursor) Current() ([]byte, []byte, error) {
 	return k, v, nil
 }
 
+func (c *MdbxCursor) Hook(method string, k []byte, v []byte) {
+	if c.bucketName == kv.TrieOfAccounts || c.bucketName == kv.TrieOfStorage {
+		log.Info(method, "bucketName", c.bucketName, "k", fmt.Sprintf("%x", k), "v", fmt.Sprintf("%x", v))
+	}
+}
+
 func (c *MdbxCursor) Delete(k []byte) error {
+	c.Hook("Delete", k, []byte{})
 	if c.bucketCfg.AutoDupSortKeysConversion {
 		return c.deleteDupSort(k)
 	}
@@ -1357,6 +1364,7 @@ func (c *MdbxCursor) PutNoOverwrite(key []byte, value []byte) error {
 }
 
 func (c *MdbxCursor) Put(key []byte, value []byte) error {
+	c.Hook("Put", key, value)
 	b := c.bucketCfg
 	if b.AutoDupSortKeysConversion {
 		if err := c.putDupSort(key, value); err != nil {
@@ -1442,6 +1450,7 @@ func (c *MdbxCursor) SeekExact(key []byte) ([]byte, []byte, error) {
 // Cast your cursor to *MdbxCursor to use this method.
 // Return error - if provided data will not sorted (or bucket have old records which mess with new in sorting manner).
 func (c *MdbxCursor) Append(k []byte, v []byte) error {
+	c.Hook("Append", k, v)
 	if len(k) == 0 {
 		return fmt.Errorf("mdbx doesn't support empty keys. bucket: %s", c.bucketName)
 	}
@@ -1596,6 +1605,7 @@ func (c *MdbxDupSortCursor) Append(k []byte, v []byte) error {
 }
 
 func (c *MdbxDupSortCursor) AppendDup(k []byte, v []byte) error {
+	c.Hook("AppendDup", k, v)
 	if err := c.appendDup(k, v); err != nil {
 		return fmt.Errorf("in AppendDup: bucket=%s, %w", c.bucketName, err)
 	}
