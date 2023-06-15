@@ -123,16 +123,21 @@ func AllComponents(ctx context.Context, cfg txpoolcfg.Config, cache kvcache.Cach
 		shanghaiTime = cfg.OverrideShanghaiTime
 	}
 
+	var pool txpool.Pool
 	txPool, err := txpool.New(newTxs, chainDB, cfg, cache, *chainID, shanghaiTime)
 	if err != nil {
 		return nil, nil, nil, nil, nil, err
 	}
+	pool = txpool.Pool(txPool)
+	if cfg.NoTxGossip {
+		pool = txpool.Pool(txpool.NewTxPoolDropRemote(txPool))
+	}
 
-	fetch := txpool.NewFetch(ctx, sentryClients, txPool, stateChangesClient, chainDB, txPoolDB, *chainID)
+	fetch := txpool.NewFetch(ctx, sentryClients, pool, stateChangesClient, chainDB, txPoolDB, *chainID)
 	//fetch.ConnectCore()
 	//fetch.ConnectSentries()
 
-	send := txpool.NewSend(ctx, sentryClients, txPool)
+	send := txpool.NewSend(ctx, sentryClients, pool)
 	txpoolGrpcServer := txpool.NewGrpcServer(ctx, txPool, txPoolDB, *chainID)
 	return txPoolDB, txPool, fetch, send, txpoolGrpcServer, nil
 }

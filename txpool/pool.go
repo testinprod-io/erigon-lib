@@ -93,7 +93,8 @@ type Pool interface {
 	AddNewGoodPeer(peerID types.PeerID)
 }
 
-var _ Pool = (*TxPool)(nil) // compile-time interface check
+var _ Pool = (*TxPool)(nil)           // compile-time interface check
+var _ Pool = (*TxPoolDropRemote)(nil) // compile-time interface check
 
 // SubPoolMarker ordered bitset responsible to sort transactions by sub-pools. Bits meaning:
 // 1. Minimum fee requirement. Set to 1 if feeCap of the transaction is no less than in-protocol parameter of minimal base fee. Set to 0 if feeCap is less than minimum base fee, which means this transaction will never be included into this particular chain.
@@ -305,6 +306,11 @@ type TxPool struct {
 	l1Cost L1CostFn
 }
 
+// disables adding remote transactions
+type TxPoolDropRemote struct {
+	*TxPool
+}
+
 func New(newTxs chan types.Announcements, coreDB kv.RoDB, cfg txpoolcfg.Config, cache kvcache.Cache, chainID uint256.Int, shanghaiTime *big.Int) (*TxPool, error) {
 	var err error
 	localsHistory, err := simplelru.NewLRU[string, struct{}](10_000, nil)
@@ -345,6 +351,10 @@ func New(newTxs chan types.Announcements, coreDB kv.RoDB, cfg txpoolcfg.Config, 
 		unprocessedRemoteByHash: map[string]int{},
 		shanghaiTime:            shanghaiTime,
 	}, nil
+}
+
+func NewTxPoolDropRemote(txPool *TxPool) *TxPoolDropRemote {
+	return &TxPoolDropRemote{TxPool: txPool}
 }
 
 func RawRLPTxToOptimismL1CostFn(payload []byte) (L1CostFn, error) {
@@ -1497,7 +1507,8 @@ func MainLoop(ctx context.Context, db kv.RwDB, coreDB kv.RoDB, p *TxPool, newTxs
 			if !p.Started() {
 				continue
 			}
-
+			// when transaction gossip disabled, we still need to call processRemoteTxs
+			// just in case to make unprocessedRemoteTxs to be cleared
 			if err := p.processRemoteTxs(ctx); err != nil {
 				if grpcutil.IsRetryLater(err) || grpcutil.IsEndOfStream(err) {
 					time.Sleep(3 * time.Second)
@@ -1536,6 +1547,14 @@ func MainLoop(ctx context.Context, db kv.RwDB, coreDB kv.RoDB, p *TxPool, newTxs
 				announcements = announcements.DedupCopy()
 
 				notifyMiningAboutNewSlots()
+
+				if p.cfg.NoTxGossip {
+					// drain newTxs for emptying newTx channel
+					// newTx channel will be filled only with local transactions
+					// early return to avoid outbound transaction propagation
+					log.Debug("[txpool] tx gossip disabled", "state", "drain new transactions")
+					return
+				}
 
 				var localTxTypes []byte
 				var localTxSizes []uint32
@@ -1594,6 +1613,11 @@ func MainLoop(ctx context.Context, db kv.RwDB, coreDB kv.RoDB, p *TxPool, newTxs
 		case <-syncToNewPeersEvery.C: // new peer
 			newPeers := p.recentlyConnectedPeers.GetAndClean()
 			if len(newPeers) == 0 {
+				continue
+			}
+			if p.cfg.NoTxGossip {
+				// avoid transaction gossiping for new peers
+				log.Debug("[txpool] tx gossip disabled", "state", "sync new peers")
 				continue
 			}
 			t := time.Now()
@@ -1906,6 +1930,11 @@ func (p *TxPool) deprecatedForEach(_ context.Context, f func(rlp []byte, sender 
 		}
 		return true
 	})
+}
+
+func (p *TxPoolDropRemote) AddRemoteTxs(ctx context.Context, newTxs types.TxSlots) {
+	// disable adding remote transactions
+	// consume remote tx from fetch
 }
 
 // CalcIntrinsicGas computes the 'intrinsic gas' for a message with the given data.
