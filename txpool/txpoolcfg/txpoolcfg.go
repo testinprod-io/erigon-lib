@@ -20,7 +20,8 @@ type Config struct {
 	PriceBump             uint64 // Price bump percentage to replace an already existing transaction
 	OverrideShanghaiTime  *big.Int
 
-	Optimism bool
+	Optimism   bool
+	NoTxGossip bool
 }
 
 var DefaultConfig = Config{
@@ -38,5 +39,6 @@ var DefaultConfig = Config{
 	PriceBump:            10, // Price bump percentage to replace an already existing transaction
 	OverrideShanghaiTime: nil,
 
-	Optimism: false,
+	Optimism:   false,
+	NoTxGossip: false,
 }
