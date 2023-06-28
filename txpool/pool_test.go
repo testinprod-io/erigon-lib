@@ -713,6 +713,54 @@ func TestShanghaiValidateTx(t *testing.T) {
 	}
 }
 
+func TestDepositTxValidateTx(t *testing.T) {
+	asrt := assert.New(t)
+
+	ch := make(chan types.Announcements, 100)
+	_, coreDB := memdb.NewTestPoolDB(t), memdb.NewTestDB(t)
+	cfg := txpoolcfg.DefaultConfig
+
+	shanghaiTime := big.NewInt(0)
+	cache := &kvcache.DummyCache{}
+	pool, err := New(ch, coreDB, cfg, cache, *u256.N1, shanghaiTime)
+	asrt.NoError(err)
+	ctx := context.Background()
+	tx, err := coreDB.BeginRw(ctx)
+	defer tx.Rollback()
+	asrt.NoError(err)
+
+	sndr := sender{nonce: 0, balance: *uint256.NewInt(math.MaxUint64)}
+	sndrAddress := make([]byte, 20)
+	sndrBytes := make([]byte, types.EncodeSenderLengthForStorage(sndr.nonce, sndr.balance))
+	types.EncodeSender(sndr.nonce, sndr.balance, sndrBytes)
+	err = tx.Put(kv.PlainState, sndrAddress, sndrBytes)
+	asrt.NoError(err)
+
+	txn := &types.TxSlot{
+		DataLen:  32,
+		FeeCap:   *uint256.NewInt(21000),
+		Gas:      500000,
+		SenderID: 0,
+		Type:     types.DepositTxType,
+	}
+
+	txns := types.TxSlots{
+		Txs:     []*types.TxSlot{txn},
+		Senders: sndrAddress,
+	}
+
+	err = pool.senders.registerNewSenders(&txns)
+	asrt.NoError(err)
+	view, err := cache.View(ctx, tx)
+	asrt.NoError(err)
+
+	reason := pool.validateTx(txn, false, view)
+
+	if reason != TxTypeNotSupported {
+		t.Errorf("expected %v, got %v", TxTypeNotSupported, reason)
+	}
+}
+
 func TestDropRemote(t *testing.T) {
 	assert, require := assert.New(t), require.New(t)
 	ch := make(chan types.Announcements, 100)
