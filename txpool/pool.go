@@ -791,6 +791,13 @@ func (p *TxPool) AddRemoteTxs(_ context.Context, newTxs types.TxSlots) {
 }
 
 func (p *TxPool) validateTx(txn *types.TxSlot, isLocal bool, stateCache kvcache.CacheView) DiscardReason {
+	// No unauthenticated deposits allowed in the transaction pool.
+	// This is for spam protection, not consensus,
+	// as the external engine-API user authenticates deposits.
+	if txn.Type == types.DepositTxType {
+		return TxTypeNotSupported
+	}
+
 	isShanghai := p.isShanghai()
 	if isShanghai {
 		if txn.DataLen > fixedgas.MaxInitCodeSize {
