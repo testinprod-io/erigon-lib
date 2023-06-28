@@ -115,6 +115,7 @@ var ErrParseTxn = fmt.Errorf("%w transaction", rlp.ErrParse)
 var ErrRejected = errors.New("rejected")
 var ErrAlreadyKnown = errors.New("already known")
 var ErrRlpTooBig = errors.New("txn rlp too big")
+var ErrTxTypeNotSupported = errors.New("transaction type not supported")
 
 func (ctx *TxParseContext) ValidateRLP(f func(txnRlp []byte) error) { ctx.validateRlp = f }
 func (ctx *TxParseContext) WithSender(v bool)                       { ctx.withSender = v }
