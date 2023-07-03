@@ -142,6 +142,7 @@ const (
 	NotReplaced         DiscardReason = 20 // There was an existing transaction with the same sender and nonce, not enough price bump to replace
 	DuplicateHash       DiscardReason = 21 // There was an existing transaction with the same hash
 	InitCodeTooLarge    DiscardReason = 22 // EIP-3860 - transaction init code is too large
+	TxTypeNotSupported  DiscardReason = 23
 )
 
 func (r DiscardReason) String() string {
@@ -192,6 +193,8 @@ func (r DiscardReason) String() string {
 		return "existing tx with same hash"
 	case InitCodeTooLarge:
 		return "initcode too large"
+	case TxTypeNotSupported:
+		return types.ErrTxTypeNotSupported.Error()
 	default:
 		panic(fmt.Sprintf("discard reason: %d", r))
 	}
@@ -788,6 +791,13 @@ func (p *TxPool) AddRemoteTxs(_ context.Context, newTxs types.TxSlots) {
 }
 
 func (p *TxPool) validateTx(txn *types.TxSlot, isLocal bool, stateCache kvcache.CacheView) DiscardReason {
+	// No unauthenticated deposits allowed in the transaction pool.
+	// This is for spam protection, not consensus,
+	// as the external engine-API user authenticates deposits.
+	if txn.Type == types.DepositTxType {
+		return TxTypeNotSupported
+	}
+
 	isShanghai := p.isShanghai()
 	if isShanghai {
 		if txn.DataLen > fixedgas.MaxInitCodeSize {
