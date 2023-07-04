@@ -30,21 +30,20 @@ import (
 	"time"
 
 	"github.com/RoaringBitmap/roaring/roaring64"
-	"github.com/ledgerwatch/erigon-lib/common/background"
 	"github.com/ledgerwatch/log/v3"
 	btree2 "github.com/tidwall/btree"
 	"golang.org/x/exp/slices"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/ledgerwatch/erigon-lib/kv/iter"
-
 	"github.com/ledgerwatch/erigon-lib/common"
+	"github.com/ledgerwatch/erigon-lib/common/background"
 	"github.com/ledgerwatch/erigon-lib/common/cmp"
 	"github.com/ledgerwatch/erigon-lib/common/dir"
 	"github.com/ledgerwatch/erigon-lib/compress"
 	"github.com/ledgerwatch/erigon-lib/etl"
 	"github.com/ledgerwatch/erigon-lib/kv"
 	"github.com/ledgerwatch/erigon-lib/kv/bitmapdb"
+	"github.com/ledgerwatch/erigon-lib/kv/iter"
 	"github.com/ledgerwatch/erigon-lib/kv/order"
 	"github.com/ledgerwatch/erigon-lib/recsplit"
 	"github.com/ledgerwatch/erigon-lib/recsplit/eliasfano32"
@@ -70,12 +69,13 @@ type History struct {
 
 	garbageFiles []*filesItem // files that exist on disk, but ignored on opening folder - because they are garbage
 
-	wal *historyWAL
+	wal    *historyWAL
+	logger log.Logger
 }
 
 func NewHistory(dir, tmpdir string, aggregationStep uint64,
 	filenameBase, indexKeysTable, indexTable, historyValsTable string,
-	compressVals bool, integrityFileExtensions []string, largeValues bool) (*History, error) {
+	compressVals bool, integrityFileExtensions []string, largeValues bool, logger log.Logger) (*History, error) {
 	h := History{
 		files:                   btree2.NewBTreeGOptions[*filesItem](filesItemLess, btree2.Options{Degree: 128, NoLocks: false}),
 		historyValsTable:        historyValsTable,
@@ -83,10 +83,11 @@ func NewHistory(dir, tmpdir string, aggregationStep uint64,
 		compressWorkers:         1,
 		integrityFileExtensions: integrityFileExtensions,
 		largeValues:             largeValues,
+		logger:                  logger,
 	}
 	h.roFiles.Store(&[]ctxItem{})
 	var err error
-	h.InvertedIndex, err = NewInvertedIndex(dir, tmpdir, aggregationStep, filenameBase, indexKeysTable, indexTable, true, append(slices.Clone(h.integrityFileExtensions), "v"))
+	h.InvertedIndex, err = NewInvertedIndex(dir, tmpdir, aggregationStep, filenameBase, indexKeysTable, indexTable, true, append(slices.Clone(h.integrityFileExtensions), "v"), logger)
 	if err != nil {
 		return nil, fmt.Errorf("NewHistory: %s, %w", filenameBase, err)
 	}
@@ -132,21 +133,21 @@ Loop:
 		subs := re.FindStringSubmatch(name)
 		if len(subs) != 3 {
 			if len(subs) != 0 {
-				log.Warn("[snapshots] file ignored by inverted index scan, more than 3 submatches", "name", name, "submatches", len(subs))
+				h.logger.Warn("[snapshots] file ignored by inverted index scan, more than 3 submatches", "name", name, "submatches", len(subs))
 			}
 			continue
 		}
 		var startStep, endStep uint64
 		if startStep, err = strconv.ParseUint(subs[1], 10, 64); err != nil {
-			log.Warn("[snapshots] file ignored by inverted index scan, parsing startTxNum", "error", err, "name", name)
+			h.logger.Warn("[snapshots] file ignored by inverted index scan, parsing startTxNum", "error", err, "name", name)
 			continue
 		}
 		if endStep, err = strconv.ParseUint(subs[2], 10, 64); err != nil {
-			log.Warn("[snapshots] file ignored by inverted index scan, parsing endTxNum", "error", err, "name", name)
+			h.logger.Warn("[snapshots] file ignored by inverted index scan, parsing endTxNum", "error", err, "name", name)
 			continue
 		}
 		if startStep > endStep {
-			log.Warn("[snapshots] file ignored by inverted index scan, startTxNum > endTxNum", "name", name)
+			h.logger.Warn("[snapshots] file ignored by inverted index scan, startTxNum > endTxNum", "name", name)
 			continue
 		}
 
@@ -156,7 +157,7 @@ Loop:
 		for _, ext := range h.integrityFileExtensions {
 			requiredFile := fmt.Sprintf("%s.%d-%d.%s", h.filenameBase, startStep, endStep, ext)
 			if !dir.FileExist(filepath.Join(h.dir, requiredFile)) {
-				log.Debug(fmt.Sprintf("[snapshots] skip %s because %s doesn't exists", name, requiredFile))
+				h.logger.Debug(fmt.Sprintf("[snapshots] skip %s because %s doesn't exists", name, requiredFile))
 				garbageFiles = append(garbageFiles, newFile)
 				continue Loop
 			}
@@ -208,7 +209,7 @@ func (h *History) openFiles() error {
 				continue
 			}
 			if item.decompressor, err = compress.NewDecompressor(datPath); err != nil {
-				log.Debug("Hisrory.openFiles: %w, %s", err, datPath)
+				h.logger.Debug("Hisrory.openFiles: %w, %s", err, datPath)
 				return false
 			}
 
@@ -218,7 +219,7 @@ func (h *History) openFiles() error {
 			idxPath := filepath.Join(h.dir, fmt.Sprintf("%s.%d-%d.vi", h.filenameBase, fromStep, toStep))
 			if dir.FileExist(idxPath) {
 				if item.index, err = recsplit.OpenIndex(idxPath); err != nil {
-					log.Debug(fmt.Errorf("Hisrory.openFiles: %w, %s", err, idxPath).Error())
+					h.logger.Debug(fmt.Errorf("Hisrory.openFiles: %w, %s", err, idxPath).Error())
 					return false
 				}
 				totalKeys += item.index.KeyCount()
@@ -254,13 +255,13 @@ func (h *History) closeWhatNotInList(fNames []string) {
 	for _, item := range toDelete {
 		if item.decompressor != nil {
 			if err := item.decompressor.Close(); err != nil {
-				log.Trace("close", "err", err, "file", item.index.FileName())
+				h.logger.Trace("close", "err", err, "file", item.index.FileName())
 			}
 			item.decompressor = nil
 		}
 		if item.index != nil {
 			if err := item.index.Close(); err != nil {
-				log.Trace("close", "err", err, "file", item.index.FileName())
+				h.logger.Trace("close", "err", err, "file", item.index.FileName())
 			}
 			item.index = nil
 		}
@@ -316,7 +317,7 @@ func (h *History) buildVi(ctx context.Context, item *filesItem, p *background.Pr
 	fName := fmt.Sprintf("%s.%d-%d.vi", h.filenameBase, fromStep, toStep)
 	idxPath := filepath.Join(h.dir, fName)
 
-	//log.Info("[snapshots] build idx", "file", fName)
+	//h.logger.Info("[snapshots] build idx", "file", fName)
 
 	p.Name.Store(&fName)
 	p.Total.Store(uint64(iiItem.decompressor.Count()) * 2)
@@ -325,7 +326,7 @@ func (h *History) buildVi(ctx context.Context, item *filesItem, p *background.Pr
 	if err != nil {
 		return err
 	}
-	return buildVi(ctx, item, iiItem, idxPath, h.tmpdir, count, p, h.compressVals)
+	return buildVi(ctx, item, iiItem, idxPath, h.tmpdir, count, p, h.compressVals, h.logger)
 }
 
 func (h *History) BuildMissedIndices(ctx context.Context, g *errgroup.Group, ps *background.ProgressSet) {
@@ -400,7 +401,7 @@ func iterateForVi(historyItem, iiItem *filesItem, p *background.Progress, compre
 	return count, nil
 }
 
-func buildVi(ctx context.Context, historyItem, iiItem *filesItem, historyIdxPath, tmpdir string, count int, p *background.Progress, compressVals bool) error {
+func buildVi(ctx context.Context, historyItem, iiItem *filesItem, historyIdxPath, tmpdir string, count int, p *background.Progress, compressVals bool, logger log.Logger) error {
 	rs, err := recsplit.NewRecSplit(recsplit.RecSplitArgs{
 		KeyCount:    count,
 		Enums:       false,
@@ -409,7 +410,7 @@ func buildVi(ctx context.Context, historyItem, iiItem *filesItem, historyIdxPath
 		TmpDir:      tmpdir,
 		IndexFile:   historyIdxPath,
 		EtlBufLimit: etl.BufferOptimalSize / 2,
-	})
+	}, logger)
 	if err != nil {
 		return fmt.Errorf("create recsplit: %w", err)
 	}
@@ -458,7 +459,7 @@ func buildVi(ctx context.Context, historyItem, iiItem *filesItem, historyIdxPath
 		}
 		if err = rs.Build(); err != nil {
 			if rs.Collision() {
-				log.Info("Building recsplit. Collision happened. It's ok. Restarting...")
+				logger.Info("Building recsplit. Collision happened. It's ok. Restarting...")
 				rs.ResetNextSalt()
 			} else {
 				return fmt.Errorf("build %s idx: %w", historyIdxPath, err)
@@ -481,6 +482,10 @@ func (h *History) DiscardHistory() {
 	h.InvertedIndex.StartWrites()
 	h.wal = h.newWriter(h.tmpdir, false, true)
 }
+func (h *History) StartUnbufferedWrites() {
+	h.InvertedIndex.StartUnbufferedWrites()
+	h.wal = h.newWriter(h.tmpdir, false, false)
+}
 func (h *History) StartWrites() {
 	h.InvertedIndex.StartWrites()
 	h.wal = h.newWriter(h.tmpdir, true, false)
@@ -494,7 +499,7 @@ func (h *History) FinishWrites() {
 func (h *History) Rotate() historyFlusher {
 	w := h.wal
 	h.wal = h.newWriter(h.wal.tmpdir, h.wal.buffered, h.wal.discard)
-	return historyFlusher{w, h.InvertedIndex.Rotate()}
+	return historyFlusher{h: w, i: h.InvertedIndex.Rotate()}
 }
 
 type historyFlusher struct {
@@ -543,7 +548,7 @@ func (h *History) newWriter(tmpdir string, buffered, discard bool) *historyWAL {
 		largeValues:      h.largeValues,
 	}
 	if buffered {
-		w.historyVals = etl.NewCollector(h.historyValsTable, tmpdir, etl.NewSortableBuffer(WALCollectorRAM))
+		w.historyVals = etl.NewCollector(h.historyValsTable, tmpdir, etl.NewSortableBuffer(WALCollectorRAM), h.logger)
 		w.historyVals.LogLvl(log.LvlTrace)
 	}
 	return w
@@ -602,6 +607,16 @@ func (h *historyWAL) addPrevValue(key1, key2, original []byte) error {
 	historyKey1 := historyKey[:lk]
 	historyVal := historyKey[lk:]
 	invIdxVal := historyKey[:lk]
+
+	if !h.buffered {
+		if err := h.h.tx.Put(h.h.historyValsTable, historyKey1, historyVal); err != nil {
+			return err
+		}
+		if err := ii.tx.Put(ii.indexKeysTable, ii.txNumBytes[:], invIdxVal); err != nil {
+			return err
+		}
+		return nil
+	}
 	if err := h.historyVals.Collect(historyKey1, historyVal); err != nil {
 		return err
 	}
@@ -639,7 +654,7 @@ func (h *History) collate(step, txFrom, txTo uint64, roTx kv.Tx) (HistoryCollati
 		}
 	}()
 	historyPath := filepath.Join(h.dir, fmt.Sprintf("%s.%d-%d.v", h.filenameBase, step, step+1))
-	if historyComp, err = compress.NewCompressor(context.Background(), "collate history", historyPath, h.tmpdir, compress.MinPatternScore, h.compressWorkers, log.LvlTrace); err != nil {
+	if historyComp, err = compress.NewCompressor(context.Background(), "collate history", historyPath, h.tmpdir, compress.MinPatternScore, h.compressWorkers, log.LvlTrace, h.logger); err != nil {
 		return HistoryCollation{}, fmt.Errorf("create %s history compressor: %w", h.filenameBase, err)
 	}
 	keysCursor, err := roTx.CursorDupSort(h.indexKeysTable)
@@ -830,7 +845,7 @@ func (h *History) buildFiles(ctx context.Context, step uint64, collation History
 		p := ps.AddNew(efHistoryFileName, 1)
 		defer ps.Delete(p)
 		efHistoryPath = filepath.Join(h.dir, efHistoryFileName)
-		efHistoryComp, err = compress.NewCompressor(ctx, "ef history", efHistoryPath, h.tmpdir, compress.MinPatternScore, h.compressWorkers, log.LvlTrace)
+		efHistoryComp, err = compress.NewCompressor(ctx, "ef history", efHistoryPath, h.tmpdir, compress.MinPatternScore, h.compressWorkers, log.LvlTrace, h.logger)
 		if err != nil {
 			return HistoryFiles{}, fmt.Errorf("create %s ef history compressor: %w", h.filenameBase, err)
 		}
@@ -868,7 +883,7 @@ func (h *History) buildFiles(ctx context.Context, step uint64, collation History
 	efHistoryIdxPath := filepath.Join(h.dir, efHistoryIdxFileName)
 	p := ps.AddNew(efHistoryIdxFileName, uint64(len(keys)*2))
 	defer ps.Delete(p)
-	if efHistoryIdx, err = buildIndexThenOpen(ctx, efHistoryDecomp, efHistoryIdxPath, h.tmpdir, len(keys), false /* values */, p); err != nil {
+	if efHistoryIdx, err = buildIndexThenOpen(ctx, efHistoryDecomp, efHistoryIdxPath, h.tmpdir, len(keys), false /* values */, p, h.logger); err != nil {
 		return HistoryFiles{}, fmt.Errorf("build %s ef history idx: %w", h.filenameBase, err)
 	}
 	if rs, err = recsplit.NewRecSplit(recsplit.RecSplitArgs{
@@ -878,7 +893,7 @@ func (h *History) buildFiles(ctx context.Context, step uint64, collation History
 		LeafSize:   8,
 		TmpDir:     h.tmpdir,
 		IndexFile:  historyIdxPath,
-	}); err != nil {
+	}, h.logger); err != nil {
 		return HistoryFiles{}, fmt.Errorf("create recsplit: %w", err)
 	}
 	rs.LogLvl(log.LvlTrace)
@@ -1039,7 +1054,7 @@ func (h *History) prune(ctx context.Context, txFrom, txTo, limit uint64, logEver
 		return nil
 	}
 
-	collector := etl.NewCollector("snapshots", h.tmpdir, etl.NewOldestEntryBuffer(etl.BufferOptimalSize))
+	collector := etl.NewCollector("snapshots", h.tmpdir, etl.NewOldestEntryBuffer(etl.BufferOptimalSize), h.logger)
 	defer collector.Close()
 
 	// Invariant: if some `txNum=N` pruned - it's pruned Fully
@@ -1217,6 +1232,7 @@ type HistoryContext struct {
 }
 
 func (h *History) MakeContext() *HistoryContext {
+
 	var hc = HistoryContext{
 		h:     h,
 		ic:    h.InvertedIndex.MakeContext(),
