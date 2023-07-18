@@ -80,36 +80,54 @@ type AggregatorV3 struct {
 	walLock  sync.RWMutex
 
 	ps *background.ProgressSet
+
+	// next fields are set only if agg.doTraceCtx is true. can enable by env: TRACE_AGG=true
+	leakDetector *dbg.LeakDetector
+	logger       log.Logger
 }
 
 type OnFreezeFunc func(frozenFileNames []string)
 
-func NewAggregatorV3(ctx context.Context, dir, tmpdir string, aggregationStep uint64, db kv.RoDB) (*AggregatorV3, error) {
+func NewAggregatorV3(ctx context.Context, dir, tmpdir string, aggregationStep uint64, db kv.RoDB, logger log.Logger) (*AggregatorV3, error) {
 	ctx, ctxCancel := context.WithCancel(ctx)
-	a := &AggregatorV3{ctx: ctx, ctxCancel: ctxCancel, ps: background.NewProgressSet(), onFreeze: func(frozenFileNames []string) {}, dir: dir, tmpdir: tmpdir, aggregationStep: aggregationStep, backgroundResult: &BackgroundResult{}, db: db, keepInDB: 2 * aggregationStep}
+	a := &AggregatorV3{
+		ctx:              ctx,
+		ctxCancel:        ctxCancel,
+		onFreeze:         func(frozenFileNames []string) {},
+		dir:              dir,
+		tmpdir:           tmpdir,
+		aggregationStep:  aggregationStep,
+		db:               db,
+		keepInDB:         2 * aggregationStep,
+		leakDetector:     dbg.NewLeakDetector("agg", dbg.SlowTx()),
+		ps:               background.NewProgressSet(),
+		backgroundResult: &BackgroundResult{},
+		logger:           logger,
+	}
 	var err error
-	if a.accounts, err = NewHistory(dir, a.tmpdir, aggregationStep, "accounts", kv.AccountHistoryKeys, kv.AccountIdx, kv.AccountHistoryVals, false, nil, false); err != nil {
+	if a.accounts, err = NewHistory(dir, a.tmpdir, aggregationStep, "accounts", kv.AccountHistoryKeys, kv.AccountIdx, kv.AccountHistoryVals, false, nil, false, logger); err != nil {
 		return nil, err
 	}
-	if a.storage, err = NewHistory(dir, a.tmpdir, aggregationStep, "storage", kv.StorageHistoryKeys, kv.StorageIdx, kv.StorageHistoryVals, false, nil, false); err != nil {
+	if a.storage, err = NewHistory(dir, a.tmpdir, aggregationStep, "storage", kv.StorageHistoryKeys, kv.StorageIdx, kv.StorageHistoryVals, false, nil, false, logger); err != nil {
 		return nil, err
 	}
-	if a.code, err = NewHistory(dir, a.tmpdir, aggregationStep, "code", kv.CodeHistoryKeys, kv.CodeIdx, kv.CodeHistoryVals, true, nil, true); err != nil {
+	if a.code, err = NewHistory(dir, a.tmpdir, aggregationStep, "code", kv.CodeHistoryKeys, kv.CodeIdx, kv.CodeHistoryVals, true, nil, true, logger); err != nil {
 		return nil, err
 	}
-	if a.logAddrs, err = NewInvertedIndex(dir, a.tmpdir, aggregationStep, "logaddrs", kv.LogAddressKeys, kv.LogAddressIdx, false, nil); err != nil {
+	if a.logAddrs, err = NewInvertedIndex(dir, a.tmpdir, aggregationStep, "logaddrs", kv.LogAddressKeys, kv.LogAddressIdx, false, nil, logger); err != nil {
 		return nil, err
 	}
-	if a.logTopics, err = NewInvertedIndex(dir, a.tmpdir, aggregationStep, "logtopics", kv.LogTopicsKeys, kv.LogTopicsIdx, false, nil); err != nil {
+	if a.logTopics, err = NewInvertedIndex(dir, a.tmpdir, aggregationStep, "logtopics", kv.LogTopicsKeys, kv.LogTopicsIdx, false, nil, logger); err != nil {
 		return nil, err
 	}
-	if a.tracesFrom, err = NewInvertedIndex(dir, a.tmpdir, aggregationStep, "tracesfrom", kv.TracesFromKeys, kv.TracesFromIdx, false, nil); err != nil {
+	if a.tracesFrom, err = NewInvertedIndex(dir, a.tmpdir, aggregationStep, "tracesfrom", kv.TracesFromKeys, kv.TracesFromIdx, false, nil, logger); err != nil {
 		return nil, err
 	}
-	if a.tracesTo, err = NewInvertedIndex(dir, a.tmpdir, aggregationStep, "tracesto", kv.TracesToKeys, kv.TracesToIdx, false, nil); err != nil {
+	if a.tracesTo, err = NewInvertedIndex(dir, a.tmpdir, aggregationStep, "tracesto", kv.TracesToKeys, kv.TracesToIdx, false, nil, logger); err != nil {
 		return nil, err
 	}
 	a.recalcMaxTxNum()
+
 	return a, nil
 }
 func (a *AggregatorV3) OnFreeze(f OnFreezeFunc) { a.onFreeze = f }
@@ -643,7 +661,7 @@ func (a *AggregatorV3) NeedSaveFilesListInDB() bool {
 }
 
 func (a *AggregatorV3) Unwind(ctx context.Context, txUnwindTo uint64, stateLoad etl.LoadFunc) error {
-	stateChanges := etl.NewCollector(a.logPrefix, a.tmpdir, etl.NewOldestEntryBuffer(etl.BufferOptimalSize))
+	stateChanges := etl.NewCollector(a.logPrefix, a.tmpdir, etl.NewOldestEntryBuffer(etl.BufferOptimalSize), a.logger)
 	defer stateChanges.Close()
 	if err := a.accounts.pruneF(txUnwindTo, math2.MaxUint64, func(_ uint64, k, v []byte) error {
 		return stateChanges.Collect(k, v)
@@ -758,9 +776,10 @@ type flusher interface {
 	Flush(ctx context.Context, tx kv.RwTx) error
 }
 
-func (a *AggregatorV3) Flush(ctx context.Context, tx kv.RwTx) error {
+func (a *AggregatorV3) rotate() []flusher {
 	a.walLock.Lock()
-	flushers := []flusher{
+	defer a.walLock.Unlock()
+	return []flusher{
 		a.accounts.Rotate(),
 		a.storage.Rotate(),
 		a.code.Rotate(),
@@ -769,7 +788,9 @@ func (a *AggregatorV3) Flush(ctx context.Context, tx kv.RwTx) error {
 		a.tracesFrom.Rotate(),
 		a.tracesTo.Rotate(),
 	}
-	a.walLock.Unlock()
+}
+func (a *AggregatorV3) Flush(ctx context.Context, tx kv.RwTx) error {
+	flushers := a.rotate()
 	defer func(t time.Time) { log.Debug("[snapshots] history flush", "took", time.Since(t)) }(time.Now())
 	for _, f := range flushers {
 		if err := f.Flush(ctx, tx); err != nil {
@@ -1442,10 +1463,6 @@ func (a *AggregatorV3) Stats() FilesStats22 {
 	return fs
 }
 
-func (a *AggregatorV3) Code() *History     { return a.code }
-func (a *AggregatorV3) Accounts() *History { return a.accounts }
-func (a *AggregatorV3) Storage() *History  { return a.storage }
-
 type AggregatorV3Context struct {
 	a          *AggregatorV3
 	accounts   *HistoryContext
@@ -1456,10 +1473,12 @@ type AggregatorV3Context struct {
 	tracesFrom *InvertedIndexContext
 	tracesTo   *InvertedIndexContext
 	keyBuf     []byte
+
+	id uint64 // set only if TRACE_AGG=true
 }
 
 func (a *AggregatorV3) MakeContext() *AggregatorV3Context {
-	return &AggregatorV3Context{
+	ac := &AggregatorV3Context{
 		a:          a,
 		accounts:   a.accounts.MakeContext(),
 		storage:    a.storage.MakeContext(),
@@ -1468,9 +1487,14 @@ func (a *AggregatorV3) MakeContext() *AggregatorV3Context {
 		logTopics:  a.logTopics.MakeContext(),
 		tracesFrom: a.tracesFrom.MakeContext(),
 		tracesTo:   a.tracesTo.MakeContext(),
+
+		id: a.leakDetector.Add(),
 	}
+
+	return ac
 }
 func (ac *AggregatorV3Context) Close() {
+	ac.a.leakDetector.Del(ac.id)
 	ac.accounts.Close()
 	ac.storage.Close()
 	ac.code.Close()
