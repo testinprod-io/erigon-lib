@@ -713,7 +713,7 @@ func (p *TxPool) validateTx(txn *types.TxSlot, isLocal bool, stateCache kvcache.
 	// This is for spam protection, not consensus,
 	// as the external engine-API user authenticates deposits.
 	if txn.Type == types.DepositTxType {
-		return TxTypeNotSupported
+		return txpoolcfg.TxTypeNotSupported
 	}
 
 	isShanghai := p.isShanghai()
