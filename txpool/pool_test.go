@@ -760,8 +760,8 @@ func TestDepositTxValidateTx(t *testing.T) {
 
 	reason := pool.validateTx(txn, false, view)
 
-	if reason != TxTypeNotSupported {
-		t.Errorf("expected %v, got %v", TxTypeNotSupported, reason)
+	if reason != txpoolcfg.TxTypeNotSupported {
+		t.Errorf("expected %v, got %v", txpoolcfg.TxTypeNotSupported, reason)
 	}
 }
 
@@ -822,7 +822,7 @@ func TestDropRemote(t *testing.T) {
 		reasons, err := txPoolDropRemote.AddLocalTxs(ctx, txSlots, tx)
 		assert.NoError(err)
 		for _, reason := range reasons {
-			assert.Equal(Success, reason, reason.String())
+			assert.Equal(txpoolcfg.Success, reason, reason.String())
 		}
 	}
 	select {
