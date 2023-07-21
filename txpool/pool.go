@@ -1,5 +1,5 @@
 /*
-   Copyright 2022 Erigon contributors
+   Copyright 2022 The Erigon contributors
 
    Licensed under the Apache License, Version 2.0 (the "License");
    you may not use this file except in compliance with the License.
@@ -23,6 +23,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
@@ -40,7 +41,6 @@ import (
 	"github.com/google/btree"
 	"github.com/hashicorp/golang-lru/v2/simplelru"
 	"github.com/holiman/uint256"
-	"github.com/ledgerwatch/erigon-lib/txpool/txpoolcfg"
 	"github.com/ledgerwatch/log/v3"
 
 	"github.com/ledgerwatch/erigon-lib/chain"
@@ -57,6 +57,7 @@ import (
 	"github.com/ledgerwatch/erigon-lib/kv"
 	"github.com/ledgerwatch/erigon-lib/kv/kvcache"
 	"github.com/ledgerwatch/erigon-lib/kv/mdbx"
+	"github.com/ledgerwatch/erigon-lib/txpool/txpoolcfg"
 	"github.com/ledgerwatch/erigon-lib/types"
 )
 
@@ -218,12 +219,13 @@ type TxPool struct {
 	started                 atomic.Bool
 	pendingBaseFee          atomic.Uint64
 	blockGasLimit           atomic.Uint64
-	shanghaiTime            *big.Int
+	shanghaiTime            *uint64
 	isPostShanghai          atomic.Bool
+	cancunTime              *uint64
+	isPostCancun            atomic.Bool
+	logger                  log.Logger
 
 	l1Cost L1CostFn
-
-	logger log.Logger
 }
 
 // disables adding remote transactions
@@ -231,7 +233,7 @@ type TxPoolDropRemote struct {
 	*TxPool
 }
 
-func New(newTxs chan types.Announcements, coreDB kv.RoDB, cfg txpoolcfg.Config, cache kvcache.Cache, chainID uint256.Int, shanghaiTime *big.Int, logger log.Logger) (*TxPool, error) {
+func New(newTxs chan types.Announcements, coreDB kv.RoDB, cfg txpoolcfg.Config, cache kvcache.Cache, chainID uint256.Int, shanghaiTime, cancunTime *big.Int, logger log.Logger) (*TxPool, error) {
 	var err error
 	localsHistory, err := simplelru.NewLRU[string, struct{}](10_000, nil)
 	if err != nil {
@@ -251,7 +253,8 @@ func New(newTxs chan types.Announcements, coreDB kv.RoDB, cfg txpoolcfg.Config, 
 	for _, sender := range cfg.TracedSenders {
 		tracedSenders[common.BytesToAddress([]byte(sender))] = struct{}{}
 	}
-	return &TxPool{
+
+	res := &TxPool{
 		lock:                    &sync.Mutex{},
 		byHash:                  map[string]*metaTx{},
 		isLocalLRU:              localsHistory,
@@ -269,9 +272,25 @@ func New(newTxs chan types.Announcements, coreDB kv.RoDB, cfg txpoolcfg.Config, 
 		chainID:                 chainID,
 		unprocessedRemoteTxs:    &types.TxSlots{},
 		unprocessedRemoteByHash: map[string]int{},
-		shanghaiTime:            shanghaiTime,
 		logger:                  logger,
-	}, nil
+	}
+
+	if shanghaiTime != nil {
+		if !shanghaiTime.IsUint64() {
+			return nil, errors.New("shanghaiTime overflow")
+		}
+		shanghaiTimeU64 := shanghaiTime.Uint64()
+		res.shanghaiTime = &shanghaiTimeU64
+	}
+	if cancunTime != nil {
+		if !cancunTime.IsUint64() {
+			return nil, errors.New("cancunTime overflow")
+		}
+		cancunTimeU64 := cancunTime.Uint64()
+		res.cancunTime = &cancunTimeU64
+	}
+
+	return res, nil
 }
 
 func NewTxPoolDropRemote(txPool *TxPool) *TxPoolDropRemote {
@@ -600,7 +619,7 @@ func (p *TxPool) IsLocal(idHash []byte) bool {
 func (p *TxPool) AddNewGoodPeer(peerID types.PeerID) { p.recentlyConnectedPeers.AddPeer(peerID) }
 func (p *TxPool) Started() bool                      { return p.started.Load() }
 
-func (p *TxPool) best(n uint16, txs *types.TxsRlp, tx kv.Tx, onTopOf, availableGas uint64, toSkip mapset.Set[[32]byte]) (bool, int, error) {
+func (p *TxPool) best(n uint16, txs *types.TxsRlp, tx kv.Tx, onTopOf, availableGas, availableDataGas uint64, toSkip mapset.Set[[32]byte]) (bool, int, error) {
 	p.lock.Lock()
 	defer p.lock.Unlock()
 
@@ -641,6 +660,12 @@ func (p *TxPool) best(n uint16, txs *types.TxsRlp, tx kv.Tx, onTopOf, availableG
 			continue
 		}
 
+		// Skip transactions that require more data gas than is available
+		if mt.Tx.BlobCount*chain.DataGasPerBlob > availableDataGas {
+			continue
+		}
+		availableDataGas -= mt.Tx.BlobCount * chain.DataGasPerBlob
+
 		// make sure we have enough gas in the caller to add this transaction.
 		// not an exact science using intrinsic gas but as close as we could hope for at
 		// this stage
@@ -649,10 +674,7 @@ func (p *TxPool) best(n uint16, txs *types.TxsRlp, tx kv.Tx, onTopOf, availableG
 			// we might find another TX with a low enough intrinsic gas to include so carry on
 			continue
 		}
-
-		if intrinsicGas <= availableGas { // check for potential underflow
-			availableGas -= intrinsicGas
-		}
+		availableGas -= intrinsicGas
 
 		txs.Txs[count] = rlpTx
 		copy(txs.Senders.At(count), sender.Bytes())
@@ -679,13 +701,13 @@ func (p *TxPool) ResetYieldedStatus() {
 	}
 }
 
-func (p *TxPool) YieldBest(n uint16, txs *types.TxsRlp, tx kv.Tx, onTopOf, availableGas uint64, toSkip mapset.Set[[32]byte]) (bool, int, error) {
-	return p.best(n, txs, tx, onTopOf, availableGas, toSkip)
+func (p *TxPool) YieldBest(n uint16, txs *types.TxsRlp, tx kv.Tx, onTopOf, availableGas, availableDataGas uint64, toSkip mapset.Set[[32]byte]) (bool, int, error) {
+	return p.best(n, txs, tx, onTopOf, availableGas, availableDataGas, toSkip)
 }
 
-func (p *TxPool) PeekBest(n uint16, txs *types.TxsRlp, tx kv.Tx, onTopOf, availableGas uint64) (bool, error) {
+func (p *TxPool) PeekBest(n uint16, txs *types.TxsRlp, tx kv.Tx, onTopOf, availableGas, availableDataGas uint64) (bool, error) {
 	set := mapset.NewThreadUnsafeSet[[32]byte]()
-	onTime, _, err := p.best(n, txs, tx, onTopOf, availableGas, set)
+	onTime, _, err := p.best(n, txs, tx, onTopOf, availableGas, availableDataGas, set)
 	return onTime, err
 }
 
@@ -720,6 +742,17 @@ func (p *TxPool) validateTx(txn *types.TxSlot, isLocal bool, stateCache kvcache.
 	if isShanghai {
 		if txn.DataLen > fixedgas.MaxInitCodeSize {
 			return txpoolcfg.InitCodeTooLarge
+		}
+	}
+	if txn.Type == types.BlobTxType {
+		if !p.isCancun() {
+			return txpoolcfg.TypeNotActivated
+		}
+		if txn.Creation {
+			return txpoolcfg.CreateBlobTxn
+		}
+		if txn.BlobCount == 0 {
+			return txpoolcfg.NoBlobs
 		}
 	}
 
@@ -762,9 +795,7 @@ func (p *TxPool) validateTx(txn *types.TxSlot, isLocal bool, stateCache kvcache.
 		return txpoolcfg.NonceTooLow
 	}
 	// Transactor should have enough funds to cover the costs
-	total := uint256.NewInt(txn.Gas)
-	total.Mul(total, &txn.FeeCap)
-	total.Add(total, &txn.Value)
+	total := requiredBalance(txn)
 	if senderBalance.Cmp(total) < 0 {
 		if txn.Traced {
 			p.logger.Info(fmt.Sprintf("TX TRACING: validateTx insufficient funds idHash=%x balance in state=%d, txn.gas*txn.tip=%d", txn.IDHash, senderBalance, total))
@@ -772,6 +803,38 @@ func (p *TxPool) validateTx(txn *types.TxSlot, isLocal bool, stateCache kvcache.
 		return txpoolcfg.InsufficientFunds
 	}
 	return txpoolcfg.Success
+}
+
+var maxUint256 = new(uint256.Int).SetAllOne()
+
+// Sender should have enough balance for: gasLimit x feeCap + dataGas x dataFeeCap + transferred_value
+// See YP, Eq (61) in Section 6.2 "Execution"
+func requiredBalance(txn *types.TxSlot) *uint256.Int {
+	// See https://github.com/ethereum/EIPs/pull/3594
+	total := uint256.NewInt(txn.Gas)
+	_, overflow := total.MulOverflow(total, &txn.FeeCap)
+	if overflow {
+		return maxUint256
+	}
+	// and https://eips.ethereum.org/EIPS/eip-4844#gas-accounting
+	if txn.BlobCount != 0 {
+		maxDataGasCost := uint256.NewInt(chain.DataGasPerBlob)
+		maxDataGasCost.Mul(maxDataGasCost, uint256.NewInt(txn.BlobCount))
+		_, overflow = maxDataGasCost.MulOverflow(maxDataGasCost, &txn.DataFeeCap)
+		if overflow {
+			return maxUint256
+		}
+		_, overflow = total.AddOverflow(total, maxDataGasCost)
+		if overflow {
+			return maxUint256
+		}
+	}
+
+	_, overflow = total.AddOverflow(total, &txn.Value)
+	if overflow {
+		return maxUint256
+	}
+	return total
 }
 
 func (p *TxPool) isShanghai() bool {
@@ -783,20 +846,45 @@ func (p *TxPool) isShanghai() bool {
 	if p.shanghaiTime == nil {
 		return false
 	}
-	shanghaiTime := p.shanghaiTime.Uint64()
+	shanghaiTime := *p.shanghaiTime
 
-	// a zero here means shanghai is always active
+	// a zero here means Shanghai is always active
 	if shanghaiTime == 0 {
 		p.isPostShanghai.Swap(true)
 		return true
 	}
 
-	now := big.NewInt(time.Now().Unix())
-	is := now.Uint64() >= shanghaiTime
-	if is {
+	now := time.Now().Unix()
+	activated := uint64(now) >= shanghaiTime
+	if activated {
 		p.isPostShanghai.Swap(true)
 	}
-	return is
+	return activated
+}
+
+func (p *TxPool) isCancun() bool {
+	// once this flag has been set for the first time we no longer need to check the timestamp
+	set := p.isPostCancun.Load()
+	if set {
+		return true
+	}
+	if p.cancunTime == nil {
+		return false
+	}
+	cancunTime := *p.cancunTime
+
+	// a zero here means Cancun is always active
+	if cancunTime == 0 {
+		p.isPostCancun.Swap(true)
+		return true
+	}
+
+	now := time.Now().Unix()
+	activated := uint64(now) >= cancunTime
+	if activated {
+		p.isPostCancun.Swap(true)
+	}
+	return activated
 }
 
 func (p *TxPool) ValidateSerializedTxn(serializedTxn []byte) error {
@@ -1100,6 +1188,9 @@ func (p *TxPool) setBaseFee(baseFee uint64) (uint64, bool) {
 	return p.pendingBaseFee.Load(), changed
 }
 
+// TODO(eip-4844) logic similar to base fee for data gasprice
+// DataFeeCap must be >= data gasprice
+
 func (p *TxPool) addLocked(mt *metaTx, announcements *types.Announcements) txpoolcfg.DiscardReason {
 	// Insert to pending pool, if pool doesn't have txn with same Nonce and bigger Tip
 	found := p.all.get(mt.Tx.SenderID, mt.Tx.Nonce)
@@ -1271,10 +1362,7 @@ func onSenderStateChange(senderID uint64, senderNonce uint64, senderBalance uint
 			mt.nonceDistance = mt.Tx.Nonce - senderNonce
 		}
 
-		// Sender has enough balance for: gasLimit x feeCap + transferred_value
-		needBalance := uint256.NewInt(mt.Tx.Gas)
-		needBalance.Mul(needBalance, &mt.Tx.FeeCap)
-		needBalance.Add(needBalance, &mt.Tx.Value)
+		needBalance := requiredBalance(mt.Tx)
 
 		if l1CostFn != nil {
 			if l1Cost := l1CostFn(mt.Tx); l1Cost != nil {
@@ -1510,18 +1598,22 @@ func MainLoop(ctx context.Context, db kv.RwDB, coreDB kv.RoDB, p *TxPool, newTxs
 							continue
 						}
 
-						// Empty rlp can happen if a transaction we want to broadcase has just been mined, for example
+						// Empty rlp can happen if a transaction we want to broadcast has just been mined, for example
 						slotsRlp = append(slotsRlp, slotRlp)
 						if p.IsLocal(hash) {
 							localTxTypes = append(localTxTypes, t)
 							localTxSizes = append(localTxSizes, size)
 							localTxHashes = append(localTxHashes, hash...)
-							localTxRlps = append(localTxRlps, slotRlp)
+							if t != types.BlobTxType { // "Nodes MUST NOT automatically broadcast blob transactions to their peers" - EIP-4844
+								localTxRlps = append(localTxRlps, slotRlp)
+							}
 						} else {
 							remoteTxTypes = append(remoteTxTypes, t)
 							remoteTxSizes = append(remoteTxSizes, size)
 							remoteTxHashes = append(remoteTxHashes, hash...)
-							remoteTxRlps = append(remoteTxRlps, slotRlp)
+							if t != types.BlobTxType { // "Nodes MUST NOT automatically broadcast blob transactions to their peers" - EIP-4844
+								remoteTxRlps = append(remoteTxRlps, slotRlp)
+							}
 						}
 					}
 					return nil
@@ -1530,6 +1622,7 @@ func MainLoop(ctx context.Context, db kv.RwDB, coreDB kv.RoDB, p *TxPool, newTxs
 					return
 				}
 				if newSlotsStreams != nil {
+					// TODO(eip-4844) What is this for? Is it OK to broadcast blob transactions?
 					newSlotsStreams.Broadcast(&proto_txpool.OnAddReply{RplTxs: slotsRlp}, p.logger)
 				}
 
@@ -1705,7 +1798,8 @@ func (p *TxPool) fromDB(ctx context.Context, tx kv.Tx, coreTx kv.Tx) error {
 		addr, txRlp := *(*[20]byte)(v[:20]), v[20:]
 		txn := &types.TxSlot{}
 
-		_, err = parseCtx.ParseTransaction(txRlp, 0, txn, nil, false /* hasEnvelope */, nil)
+		// TODO(eip-4844) ensure wrappedWithBlobs when transactions are saved to the DB
+		_, err = parseCtx.ParseTransaction(txRlp, 0, txn, nil, false /* hasEnvelope */, true /*wrappedWithBlobs*/, nil)
 		if err != nil {
 			err = fmt.Errorf("err: %w, rlp: %x", err, txRlp)
 			p.logger.Warn("[txpool] fromDB: parseTransaction", "err", err)
