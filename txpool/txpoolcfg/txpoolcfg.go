@@ -75,7 +75,10 @@ const (
 	NotReplaced         DiscardReason = 20 // There was an existing transaction with the same sender and nonce, not enough price bump to replace
 	DuplicateHash       DiscardReason = 21 // There was an existing transaction with the same hash
 	InitCodeTooLarge    DiscardReason = 22 // EIP-3860 - transaction init code is too large
-	TxTypeNotSupported  DiscardReason = 23
+	TypeNotActivated    DiscardReason = 23 // For example, an EIP-4844 transaction is submitted before Cancun activation
+	CreateBlobTxn       DiscardReason = 24 // Blob transactions cannot have the form of a create transaction
+	NoBlobs             DiscardReason = 25 // Blob transactions must have at least one blob
+	TxTypeNotSupported  DiscardReason = 26
 )
 
 func (r DiscardReason) String() string {
@@ -128,6 +131,12 @@ func (r DiscardReason) String() string {
 		return "initcode too large"
 	case TxTypeNotSupported:
 		return types.ErrTxTypeNotSupported.Error()
+	case TypeNotActivated:
+		return "fork supporting this transaction type is not activated yet"
+	case CreateBlobTxn:
+		return "blob transactions cannot have the form of a create transaction"
+	case NoBlobs:
+		return "blob transactions must have at least one blob"
 	default:
 		panic(fmt.Sprintf("discard reason: %d", r))
 	}
