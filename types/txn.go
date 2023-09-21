@@ -326,7 +326,7 @@ func (ctx *TxParseContext) parseTransactionBody(payload []byte, pos, p0 int, slo
 			return 0, fmt.Errorf("%w: depostTx sourchHash: %s", ErrParseTxn, err)
 		}
 		// From
-		dataPos, dataLen, err = rlp.String(payload, p)
+		dataPos, dataLen, err := rlp.String(payload, p)
 		if err != nil {
 			return 0, fmt.Errorf("%w: depostTx from: %s", ErrParseTxn, err)
 		}
