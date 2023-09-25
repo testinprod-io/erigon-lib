@@ -22,9 +22,9 @@ import (
 	"time"
 
 	"github.com/c2h5oh/datasize"
+	mdbx2 "github.com/erigontech/mdbx-go/mdbx"
 	"github.com/holiman/uint256"
 	"github.com/ledgerwatch/log/v3"
-	mdbx2 "github.com/torquem-ch/mdbx-go/mdbx"
 
 	"github.com/ledgerwatch/erigon-lib/chain"
 	"github.com/ledgerwatch/erigon-lib/direct"
@@ -102,12 +102,29 @@ func SaveChainConfigIfNeed(ctx context.Context, coreDB kv.RoDB, txPoolDB kv.RwDB
 
 func AllComponents(ctx context.Context, cfg txpoolcfg.Config, cache kvcache.Cache, newTxs chan types.Announcements, chainDB kv.RoDB,
 	sentryClients []direct.SentryClient, stateChangesClient txpool.StateChangesClient, logger log.Logger) (kv.RwDB, *txpool.TxPool, *txpool.Fetch, *txpool.Send, *txpool.GrpcServer, error) {
-	txPoolDB, err := mdbx.NewMDBX(log.New()).Label(kv.TxPoolDB).Path(cfg.DBDir).
+	opts := mdbx.NewMDBX(log.New()).Label(kv.TxPoolDB).Path(cfg.DBDir).
 		WithTableCfg(func(defaultBuckets kv.TableCfg) kv.TableCfg { return kv.TxpoolTablesCfg }).
 		Flags(func(f uint) uint { return f ^ mdbx2.Durable | mdbx2.SafeNoSync }).
-		GrowthStep(16 * datasize.MB).
-		SyncPeriod(30 * time.Second).
-		Open()
+		SyncPeriod(30 * time.Second)
+
+	if cfg.MdbxPageSize.Bytes() > 0 {
+		opts = opts.PageSize(cfg.MdbxPageSize.Bytes())
+	}
+
+	if cfg.MdbxDBSizeLimit > 0 {
+		opts = opts.MapSize(cfg.MdbxDBSizeLimit)
+	} else {
+		opts = opts.MapSize(1 * datasize.GB)
+
+	}
+	if cfg.MdbxGrowthStep > 0 {
+		opts = opts.GrowthStep(cfg.MdbxGrowthStep)
+	} else {
+		opts = opts.GrowthStep(16 * datasize.MB)
+	}
+
+	txPoolDB, err := opts.Open()
+
 	if err != nil {
 		return nil, nil, nil, nil, nil, err
 	}
@@ -120,10 +137,10 @@ func AllComponents(ctx context.Context, cfg txpoolcfg.Config, cache kvcache.Cach
 	chainID, _ := uint256.FromBig(chainConfig.ChainID)
 
 	shanghaiTime := chainConfig.ShanghaiTime
-	if cfg.OverrideShanghaiTime != nil {
-		shanghaiTime = cfg.OverrideShanghaiTime
-	}
 	cancunTime := chainConfig.CancunTime
+	if cfg.OverrideCancunTime != nil {
+		cancunTime = cfg.OverrideCancunTime
+	}
 
 	var pool txpool.Pool
 	txPool, err := txpool.New(newTxs, chainDB, cfg, cache, *chainID, shanghaiTime, cancunTime, logger)
