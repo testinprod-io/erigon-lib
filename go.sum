@@ -377,8 +377,8 @@ github.com/stretchr/testify v1.8.0/go.mod h1:yNjHg4UonilssWZ8iaSj1OCr/vHnekPRkoO
 github.com/stretchr/testify v1.8.1/go.mod h1:w2LPCIKwWwSfY2zedu0+kehJoqGctiVI29o6fzry7u4=
 github.com/stretchr/testify v1.8.4 h1:CcVxjf3Q8PM0mHUKJCdn+eZZtm5yQwehR5yeSVQQcUk=
 github.com/stretchr/testify v1.8.4/go.mod h1:sz/lmYIOXD/1dqDmKjjqLyZ2RngseejIcXlSw2iwfAo=
-github.com/testinprod-io/erigon-interfaces v0.0.0-20230921055943-88f623deb087 h1:QiSq6AK5RMIl4ebc6R9gNXHWua7eOVF+mtfUic8W4eo=
-github.com/testinprod-io/erigon-interfaces v0.0.0-20230921055943-88f623deb087/go.mod h1:ugQv1QllJzBny3cKZKxUrSnykkjkBgm27eQM6dnGAcc=
+github.com/testinprod-io/erigon-interfaces v0.0.0-20230925052814-3e8d7f8f455f h1:5M6ahLfvgoyK846nPZYPiH2B20u8vVoBB1viTytw1FM=
+github.com/testinprod-io/erigon-interfaces v0.0.0-20230925052814-3e8d7f8f455f/go.mod h1:ugQv1QllJzBny3cKZKxUrSnykkjkBgm27eQM6dnGAcc=
 github.com/tidwall/btree v1.6.0 h1:LDZfKfQIBHGHWSwckhXI0RPSXzlo+KYdjK7FWSqOzzg=
 github.com/tidwall/btree v1.6.0/go.mod h1:twD9XRA5jj9VUQGELzDO4HPQTNJsoWWfYEL+EUQ2cKY=
 github.com/tinylib/msgp v1.0.2/go.mod h1:+d+yLhGm8mzTaHzB+wgMYrodPfmZrzkirds8fDWklFE=
