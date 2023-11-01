@@ -6,12 +6,14 @@ on:
       - stable
       - alpha
       - op-erigon
+      - tip/canyon
   pull_request:
     branches:
       - main
       - stable
       - alpha
       - op-erigon
+      - tip/canyon
 env:
   CGO_ENABLED: "1"
   CGO_CXXFLAGS: "-g -O2 -std=c++17"
