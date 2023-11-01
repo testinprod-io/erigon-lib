@@ -451,12 +451,16 @@ func (ctx *TxParseContext) ParseTransaction(payload []byte, pos int, slot *TxSlo
 			vByte = byte(ctx.V.Uint64() - 27)
 			ctx.ChainID.Set(&ctx.cfg.ChainID)
 		} else {
-			ctx.ChainID.Sub(&ctx.V, u256.N35)
-			ctx.ChainID.Rsh(&ctx.ChainID, 1)
-			if !ctx.ChainID.Eq(&ctx.cfg.ChainID) {
-				return 0, fmt.Errorf("%w: %s, %d (expected %d)", ErrParseTxn, "invalid chainID", ctx.ChainID.Uint64(), ctx.cfg.ChainID.Uint64())
+			// avoid underflow by not deriving chain id from v
+			if ctx.V.IsZero() {
+				ctx.ChainID.Set(&ctx.cfg.ChainID)
+			} else {
+				ctx.ChainID.Sub(&ctx.V, u256.N35)
+				ctx.ChainID.Rsh(&ctx.ChainID, 1)
+				if !ctx.ChainID.Eq(&ctx.cfg.ChainID) {
+					return 0, fmt.Errorf("%w: %s, %d (expected %d)", ErrParseTxn, "invalid chainID 1234", ctx.ChainID.Uint64(), ctx.cfg.ChainID.Uint64())
+				}
 			}
-
 			chainIDBits = ctx.ChainID.BitLen()
 			if chainIDBits <= 7 {
 				chainIDLen = 1
@@ -467,8 +471,14 @@ func (ctx *TxParseContext) ParseTransaction(payload []byte, pos int, slot *TxSlo
 			sigHashLen += uint(chainIDLen) // For chainId
 			sigHashLen += 2                // For two extra zeros
 
-			ctx.DeriveChainID.Sub(&ctx.V, &ctx.ChainIDMul)
-			vByte = byte(ctx.DeriveChainID.Sub(&ctx.DeriveChainID, u256.N8).Uint64() - 27)
+			// avoid underflow by not deriving DeriveChainID from v
+			if ctx.V.IsZero() {
+				// do not use preallocated DeriveChainID
+				vByte = byte(0)
+			} else {
+				ctx.DeriveChainID.Sub(&ctx.V, &ctx.ChainIDMul)
+				vByte = byte(ctx.DeriveChainID.Sub(&ctx.DeriveChainID, u256.N8).Uint64() - 27)
+			}
 		}
 	} else {
 		var v uint64
