@@ -69,6 +69,7 @@ type Config struct {
 
 	BedrockBlock *big.Int `json:"bedrockBlock,omitempty"` // Bedrock switch block (nil = no fork, 0 = already on optimism bedrock)
 	RegolithTime *big.Int `json:"regolithTime,omitempty"` // Regolith switch time (nil = no fork, 0 = already on optimism regolith)
+	CanyonTime   *big.Int `json:"canyonTime,omitempty"`   // Canyon switch time (nil = no fork, 0 = already on optimism canyon)
 
 	Eip1559FeeCollector           *common.Address `json:"eip1559FeeCollector,omitempty"`           // (Optional) Address where burnt EIP-1559 fees go to
 	Eip1559FeeCollectorTransition *big.Int        `json:"eip1559FeeCollectorTransition,omitempty"` // (Optional) Block from which burnt EIP-1559 fees go to the Eip1559FeeCollector
@@ -231,6 +232,10 @@ func (c *Config) IsRegolith(time uint64) bool {
 	return isForked(c.RegolithTime, time)
 }
 
+func (c *Config) IsCanyon(time uint64) bool {
+	return isForked(c.CanyonTime, time)
+}
+
 // IsOptimism returns whether the node is an optimism node or not.
 func (c *Config) IsOptimism() bool {
 	return c.Optimism != nil
@@ -243,6 +248,10 @@ func (c *Config) IsOptimismBedrock(num uint64) bool {
 
 func (c *Config) IsOptimismRegolith(time uint64) bool {
 	return c.IsOptimism() && c.IsRegolith(time)
+}
+
+func (c *Config) IsOptimismCanyon(time uint64) bool {
+	return c.IsOptimism() && c.IsCanyon(time)
 }
 
 // IsOptimismPreBedrock returns true iff this is an optimism node & bedrock is not yet active
@@ -572,6 +581,7 @@ type Rules struct {
 	IsBerlin, IsLondon, IsShanghai, IsCancun, IsPrague      bool
 	IsEip1559FeeCollector, IsAura                           bool
 	IsOptimismBedrock, IsOptimismRegolith                   bool
+	IsOptimismCanyon                                        bool
 }
 
 // Rules ensures c's ChainID is not nil and returns a new Rules instance
@@ -599,6 +609,7 @@ func (c *Config) Rules(num uint64, time uint64) *Rules {
 		IsAura:                c.Aura != nil,
 		IsOptimismBedrock:     c.IsOptimismBedrock(num),
 		IsOptimismRegolith:    c.IsOptimismRegolith(time),
+		IsOptimismCanyon:      c.IsOptimismCanyon(time),
 	}
 }
 
