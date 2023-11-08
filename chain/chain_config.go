@@ -86,9 +86,9 @@ type Config struct {
 
 // OptimismConfig is the optimism config.
 type OptimismConfig struct {
-	EIP1559Elasticity            uint64 `json:"eip1559Elasticity"`
-	EIP1559Denominator           uint64 `json:"eip1559Denominator"`
-	EIP1559DenominatorPostCanyon uint64 `json:"eip1559DenominatorPostCanyon"`
+	EIP1559Elasticity        uint64 `json:"eip1559Elasticity"`
+	EIP1559Denominator       uint64 `json:"eip1559Denominator"`
+	EIP1559DenominatorCanyon uint64 `json:"eip1559DenominatorCanyon"`
 }
 
 // String implements the stringer interface, returning the optimism fee config details.
@@ -264,7 +264,7 @@ func (c *Config) IsOptimismPreBedrock(num uint64) bool {
 func (c *Config) BaseFeeChangeDenominator(defaultParam, time uint64) uint64 {
 	if c.IsOptimism() {
 		if c.IsCanyon(time) {
-			return c.Optimism.EIP1559DenominatorPostCanyon
+			return c.Optimism.EIP1559DenominatorCanyon
 		}
 		return c.Optimism.EIP1559Denominator
 	}
